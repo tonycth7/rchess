@@ -2,16 +2,11 @@
 use std::fs;
 use std::path::PathBuf;
 
+// ── Theme ─────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
-    Classic,      // lichess cream/brown  ← default, "original"
-    Tournament,   // forest green + gold
-    Mocha,        // warm brown + cream
-    Slate,        // cool grey + cyan
-    Midnight,     // dark navy + purple
-    Crimson,      // deep red + white
+    Classic, Tournament, Mocha, Slate, Midnight, Crimson,
 }
-
 impl Theme {
     pub const ALL: &'static [Theme] = &[
         Theme::Classic, Theme::Tournament, Theme::Mocha,
@@ -19,7 +14,7 @@ impl Theme {
     ];
     pub fn name(self) -> &'static str {
         match self {
-            Theme::Classic     => "Classic      (cream/brown, original)",
+            Theme::Classic     => "Classic      (cream/brown)",
             Theme::Tournament  => "Tournament   (green/gold)",
             Theme::Mocha       => "Mocha        (brown/cream)",
             Theme::Slate       => "Slate        (grey/cyan)",
@@ -27,7 +22,6 @@ impl Theme {
             Theme::Crimson     => "Crimson      (red/white)",
         }
     }
-    /// (light_sq, dark_sq)
     pub fn squares(self) -> ((u8,u8,u8),(u8,u8,u8)) {
         match self {
             Theme::Classic    => ((240,217,181),(181,136, 99)),
@@ -38,7 +32,6 @@ impl Theme {
             Theme::Crimson    => ((160, 60, 60),( 90, 30, 30)),
         }
     }
-    /// UI chrome accent (borders, headings)
     pub fn accent(self) -> (u8,u8,u8) {
         match self {
             Theme::Classic    => (160,110, 60),
@@ -49,10 +42,9 @@ impl Theme {
             Theme::Crimson    => (240,200,200),
         }
     }
-    /// Selected-piece square highlight
     pub fn select(self) -> (u8,u8,u8) {
         match self {
-            Theme::Classic    => (205,210, 60),   // classic yellow-green
+            Theme::Classic    => (205,210, 60),
             Theme::Tournament => (180,160, 40),
             Theme::Mocha      => (200,170, 80),
             Theme::Slate      => ( 60,180,180),
@@ -60,46 +52,39 @@ impl Theme {
             Theme::Crimson    => (220, 80, 80),
         }
     }
-    /// Cursor (un-selected hover) square highlight
     pub fn cursor(self) -> (u8,u8,u8) {
         match self {
-            Theme::Classic => (246,246,130),   // soft yellow, like lichess
+            Theme::Classic => (246,246,130),
             _              => ( 60,110, 80),
         }
     }
-    /// Last-move square tint (blended with square)
     pub fn last_move(self) -> (u8,u8,u8) {
         match self {
             Theme::Classic => (206,210, 90),
             _              => self.accent(),
         }
     }
-    /// Piece colors (white_piece, black_piece)
     pub fn piece_colors(self) -> ((u8,u8,u8),(u8,u8,u8)) {
         match self {
             Theme::Classic => ((255,255,255),(10,10,10)),
             _              => ((240,235,210),(28,18, 8)),
         }
     }
-    /// (bg_root, bg_panel) — background tones that match the theme
     pub fn bg_colors(self) -> ((u8,u8,u8),(u8,u8,u8)) {
         match self {
-            Theme::Classic    => ((36, 22, 12), (52, 34, 18)),
-            Theme::Tournament => ((14, 20, 14), (22, 30, 22)),
-            Theme::Mocha      => ((30, 18,  8), (44, 28, 14)),
-            Theme::Slate      => ((16, 20, 28), (22, 28, 40)),
-            Theme::Midnight   => (( 8,  8, 20), (14, 14, 32)),
-            Theme::Crimson    => ((28,  8,  8), (42, 14, 14)),
+            Theme::Classic    => ((36, 22, 12),(52, 34, 18)),
+            Theme::Tournament => ((14, 20, 14),(22, 30, 22)),
+            Theme::Mocha      => ((30, 18,  8),(44, 28, 14)),
+            Theme::Slate      => ((16, 20, 28),(22, 28, 40)),
+            Theme::Midnight   => (( 8,  8, 20),(14, 14, 32)),
+            Theme::Crimson    => ((28,  8,  8),(42, 14, 14)),
         }
     }
 }
 
+// ── PieceStyle ────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PieceStyle {
-    Unicode,
-    Letters,
-    FatLetters,
-}
+pub enum PieceStyle { Unicode, Letters, FatLetters }
 impl PieceStyle {
     pub const ALL: &'static [PieceStyle] = &[
         PieceStyle::Unicode, PieceStyle::Letters, PieceStyle::FatLetters,
@@ -126,6 +111,7 @@ impl PieceStyle {
     }
 }
 
+// ── AiDepth ───────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AiDepth { Easy=1, Medium=2, Hard=3, Expert=4 }
 impl AiDepth {
@@ -140,7 +126,17 @@ impl AiDepth {
     }
     pub fn depth(self) -> u8 { self as u8 }
 }
+impl std::str::FromStr for AiDepth {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        Ok(match s {
+            "1" => AiDepth::Easy, "2" => AiDepth::Medium, "4" => AiDepth::Expert,
+            _   => AiDepth::Hard,
+        })
+    }
+}
 
+// ── MoveHints ─────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MoveHints { Dots, Highlight, None }
 impl MoveHints {
@@ -154,15 +150,65 @@ impl MoveHints {
     }
 }
 
+// ── TimeControl ───────────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimeControl {
+    Infinite,           // no clock
+    Bullet,             // 1 min each
+    Blitz,              // 3 min each
+    Rapid,              // 10 min each
+    Classical,          // 30 min each
+}
+impl TimeControl {
+    pub const ALL: &'static [TimeControl] = &[
+        TimeControl::Infinite,
+        TimeControl::Bullet,
+        TimeControl::Blitz,
+        TimeControl::Rapid,
+        TimeControl::Classical,
+    ];
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeControl::Infinite  => "Infinite   (no clock)",
+            TimeControl::Bullet    => "Bullet     (1 min each)",
+            TimeControl::Blitz     => "Blitz      (3 min each)",
+            TimeControl::Rapid     => "Rapid      (10 min each)",
+            TimeControl::Classical => "Classical  (30 min each)",
+        }
+    }
+    /// Initial time in milliseconds for each player. None = infinite.
+    pub fn initial_ms(self) -> Option<u64> {
+        match self {
+            TimeControl::Infinite  => None,
+            TimeControl::Bullet    => Some(60_000),
+            TimeControl::Blitz     => Some(180_000),
+            TimeControl::Rapid     => Some(600_000),
+            TimeControl::Classical => Some(1_800_000),
+        }
+    }
+    pub fn short_label(self) -> &'static str {
+        match self {
+            TimeControl::Infinite  => "∞",
+            TimeControl::Bullet    => "1'",
+            TimeControl::Blitz     => "3'",
+            TimeControl::Rapid     => "10'",
+            TimeControl::Classical => "30'",
+        }
+    }
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub theme:        Theme,
     pub piece_style:  PieceStyle,
     pub ai_depth:     AiDepth,
     pub move_hints:   MoveHints,
+    pub time_control: TimeControl,
     pub show_coords:  bool,
-    pub show_clock:   bool,
-    pub flip_board:   bool,
+    pub show_clock:   bool,       // show move counter
+    pub flip_board:   bool,       // always flip (manual)
+    pub auto_flip:    bool,       // auto-flip in two-player each turn
     pub confirm_move: bool,
 }
 
@@ -173,9 +219,11 @@ impl Default for Config {
             piece_style:  PieceStyle::Unicode,
             ai_depth:     AiDepth::Hard,
             move_hints:   MoveHints::Dots,
+            time_control: TimeControl::Infinite,
             show_coords:  true,
             show_clock:   true,
             flip_board:   false,
+            auto_flip:    false,
             confirm_move: false,
         }
     }
@@ -206,17 +254,23 @@ impl Config {
                             "fatletters" => PieceStyle::FatLetters,
                             _            => PieceStyle::Unicode,
                         },
-                        "ai_depth" => cfg.ai_depth = match val {
-                            "1"=>"AiDepth::Easy", "2"=>"AiDepth::Medium", "4"=>"AiDepth::Expert", _=>"AiDepth::Hard"
-                        }.parse().unwrap_or(AiDepth::Hard),
-                        "move_hints" => cfg.move_hints = match val {
-                            "highlight" => MoveHints::Highlight,
-                            "none"      => MoveHints::None,
-                            _           => MoveHints::Dots,
+                        "ai_depth"     => cfg.ai_depth    = val.parse().unwrap_or(AiDepth::Hard),
+                        "move_hints"   => cfg.move_hints  = match val {
+                            "highlight"  => MoveHints::Highlight,
+                            "none"       => MoveHints::None,
+                            _            => MoveHints::Dots,
+                        },
+                        "time_control" => cfg.time_control = match val {
+                            "bullet"    => TimeControl::Bullet,
+                            "blitz"     => TimeControl::Blitz,
+                            "rapid"     => TimeControl::Rapid,
+                            "classical" => TimeControl::Classical,
+                            _           => TimeControl::Infinite,
                         },
                         "show_coords"  => cfg.show_coords  = val == "true",
                         "show_clock"   => cfg.show_clock   = val == "true",
                         "flip_board"   => cfg.flip_board   = val == "true",
+                        "auto_flip"    => cfg.auto_flip    = val == "true",
                         "confirm_move" => cfg.confirm_move = val == "true",
                         _ => {}
                     }
@@ -229,20 +283,38 @@ impl Config {
     pub fn save(&self) {
         if let Some(path) = config_path() {
             let _ = fs::write(path, format!(
-                "# Chess TUI  — edit here or use in-game Settings (s)\n\n\
+                "# RChess TUI — edit here or use in-game Settings (s)\n\n\
                  theme        = {}\n\
                  piece_style  = {}\n\
                  ai_depth     = {}\n\
                  move_hints   = {}\n\
+                 time_control = {}\n\
                  show_coords  = {}\n\
                  show_clock   = {}\n\
                  flip_board   = {}\n\
+                 auto_flip    = {}\n\
                  confirm_move = {}\n",
-                match self.theme { Theme::Classic=>"classic", Theme::Tournament=>"tournament", Theme::Mocha=>"mocha", Theme::Slate=>"slate", Theme::Midnight=>"midnight", Theme::Crimson=>"crimson" },
-                match self.piece_style { PieceStyle::Unicode=>"unicode", PieceStyle::Letters=>"letters", PieceStyle::FatLetters=>"fatletters" },
+                match self.theme {
+                    Theme::Classic=>"classic", Theme::Tournament=>"tournament",
+                    Theme::Mocha=>"mocha",    Theme::Slate=>"slate",
+                    Theme::Midnight=>"midnight", Theme::Crimson=>"crimson",
+                },
+                match self.piece_style {
+                    PieceStyle::Unicode=>"unicode", PieceStyle::Letters=>"letters",
+                    PieceStyle::FatLetters=>"fatletters",
+                },
                 self.ai_depth.depth(),
-                match self.move_hints { MoveHints::Dots=>"dots", MoveHints::Highlight=>"highlight", MoveHints::None=>"none" },
-                self.show_coords, self.show_clock, self.flip_board, self.confirm_move,
+                match self.move_hints {
+                    MoveHints::Dots=>"dots", MoveHints::Highlight=>"highlight",
+                    MoveHints::None=>"none",
+                },
+                match self.time_control {
+                    TimeControl::Infinite=>"infinite",  TimeControl::Bullet=>"bullet",
+                    TimeControl::Blitz=>"blitz",        TimeControl::Rapid=>"rapid",
+                    TimeControl::Classical=>"classical",
+                },
+                self.show_coords, self.show_clock, self.flip_board,
+                self.auto_flip,   self.confirm_move,
             ));
         }
     }
@@ -251,18 +323,5 @@ impl Config {
 fn config_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| PathBuf::from(h).join(".chess_tui.conf"))
-}
-
-// Allow parsing AiDepth from string slice (used in load())
-impl std::str::FromStr for AiDepth {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, ()> {
-        Ok(match s {
-            "AiDepth::Easy"   => AiDepth::Easy,
-            "AiDepth::Medium" => AiDepth::Medium,
-            "AiDepth::Expert" => AiDepth::Expert,
-            _                 => AiDepth::Hard,
-        })
-    }
+        .map(|h| PathBuf::from(h).join(".rchess_tui.conf"))
 }

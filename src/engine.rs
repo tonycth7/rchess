@@ -172,3 +172,57 @@ pub fn game_status(b:&Board,color:Color,ep:Option<(usize,usize)>,cast:&Castle)->
     let moves=legal(b,color,ep,cast);let chk=in_check(b,color);
     match(moves.is_empty(),chk){(true,true)=>Status::Checkmate,(true,false)=>Status::Stalemate,(false,true)=>Status::Check,_=>Status::Active}
 }
+
+/// Convert a move to SAN notation (for PGN export).
+/// Requires the board state *before* the move is applied.
+pub fn mv_to_san(board: &Board, mv: &Mv, ep: Option<(usize,usize)>, cast: &Castle) -> String {
+    if mv.castle == 1 { return "O-O".to_string(); }
+    if mv.castle == 2 { return "O-O-O".to_string(); }
+
+    let piece = match board[mv.fr.0][mv.fr.1] { Some(p) => p, None => return "??".to_string() };
+    let is_cap = board[mv.to.0][mv.to.1].is_some() || mv.ep;
+    let mut s = String::new();
+
+    // Piece letter (pawns get none)
+    s.push_str(match piece.k {
+        Kind::P => "", Kind::N => "N", Kind::B => "B",
+        Kind::R => "R", Kind::Q => "Q", Kind::K => "K",
+    });
+
+    // Disambiguation for pieces other than pawns/kings
+    if !matches!(piece.k, Kind::P | Kind::K) {
+        let ambiguous: Vec<Mv> = legal(board, piece.c, ep, cast)
+            .into_iter()
+            .filter(|m| m.to == mv.to && m.fr != mv.fr
+                && board[m.fr.0][m.fr.1].map(|p| p.k == piece.k).unwrap_or(false))
+            .collect();
+        if !ambiguous.is_empty() {
+            let same_col = ambiguous.iter().any(|m| m.fr.1 == mv.fr.1);
+            let same_row = ambiguous.iter().any(|m| m.fr.0 == mv.fr.0);
+            if !same_col {
+                s.push((b'a' + mv.fr.1 as u8) as char);
+            } else if !same_row {
+                s.push(char::from_digit((8 - mv.fr.0) as u32, 10).unwrap_or('?'));
+            } else {
+                s.push((b'a' + mv.fr.1 as u8) as char);
+                s.push(char::from_digit((8 - mv.fr.0) as u32, 10).unwrap_or('?'));
+            }
+        }
+    }
+
+    // Pawn capture: include source file
+    if piece.k == Kind::P && is_cap {
+        s.push((b'a' + mv.fr.1 as u8) as char);
+    }
+
+    if is_cap { s.push('x'); }
+
+    s.push((b'a' + mv.to.1 as u8) as char);
+    s.push(char::from_digit((8 - mv.to.0) as u32, 10).unwrap_or('?'));
+
+    if let Some(k) = mv.promo {
+        s.push('=');
+        s.push(match k { Kind::Q=>'Q', Kind::R=>'R', Kind::B=>'B', _=>'N' });
+    }
+    s
+}
