@@ -1,10 +1,16 @@
-// src/main.rs  — RChess TUI v0.3
+// src/main.rs  — RChess TUI v0.7
+#![allow(dead_code)]
+#![allow(unused)]
+#[macro_use]
+mod log;
 mod engine;
 mod ai;
 mod book;
 mod app;
 mod config;
 mod ui;
+mod png_export;
+mod analysis;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -25,9 +31,7 @@ fn main() -> io::Result<()> {
     for arg in &args[1..] {
         match arg.as_str() {
             "-v" | "--version" | "-V" => {
-                println!("RChess-tui v{}", VERSION);
-                println!("Features: opening book, draw offers, replay, mouse");
-                println!("Built with ratatui 0.27 + crossterm 0.27");
+                println!("rChess-tui v{}", VERSION);
                 return Ok(());
             }
             "-h" | "--help" => {
@@ -42,20 +46,24 @@ fn main() -> io::Result<()> {
                 println!("  arrows / hjkl         Move cursor");
                 println!("  Enter / Space         Select piece / confirm");
                 println!("  any letter            Type a move (e2e4, Nf3, O-O)");
+                println!("  E (Shift+E)           Export board as PNG (with preview)");
                 println!("  u                     Undo");
                 println!("  d                     Offer draw (PvP only)");
-                println!("  r                     Replay (after game ends)");
+                println!("  r                     Replay");
                 println!("  n / s / q             New game / Settings / Menu");
                 println!("  mouse click           Select and move pieces");
+                println!();
+                println!("FILES:");
+                println!("  Config:  ~/.config/rchess/rchess_tui.conf");
+                println!("  Exports: ~/rchess_export/");
                 return Ok(());
             }
             _ => {
-                eprintln!("Unknown argument: {}", arg);
-                eprintln!("Run 'RChess --help' for usage.");
+                println!("Unknown argument: {}", arg);
+                println!("Run 'rchess --help' for usage.");
                 std::process::exit(1);
             }
         }
-
     }
 
     // ── Terminal setup ────────────────────────────────────────────────────────
@@ -78,13 +86,14 @@ fn main() -> io::Result<()> {
                 // ── Keyboard ──────────────────────────────────────────────────
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     match app.screen {
-                        Screen::Menu      => app.handle_menu_key(key.code),
-                        Screen::ColorPick => app.handle_color_key(key.code),
-                        Screen::Settings  => app.handle_settings_key(key.code),
-                        Screen::Game      => app.handle_game_key(key.code),
-                        Screen::Promo     => app.handle_promo_key(key.code),
-                        Screen::DrawOffer => app.handle_draw_offer_key(key.code),
-                        Screen::Replay    => app.handle_replay_key(key.code),
+                        Screen::Menu        => app.handle_menu_key(key.code),
+                        Screen::ColorPick   => app.handle_color_key(key.code),
+                        Screen::Settings    => app.handle_settings_key(key.code),
+                        Screen::Game        => app.handle_game_key(key.code),
+                        Screen::Promo       => app.handle_promo_key(key.code),
+                        Screen::DrawOffer   => app.handle_draw_offer_key(key.code),
+                        Screen::Replay      => app.handle_replay_key(key.code),
+                        Screen::PngPreview  => app.handle_png_preview_key(key.code),
                     }
                 }
                 // ── Mouse ─────────────────────────────────────────────────────

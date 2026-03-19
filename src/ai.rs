@@ -91,3 +91,58 @@ pub fn best_mv(
     }
     best
 }
+
+/// Like best_mv but also returns the board evaluation (centipawns, White positive).
+/// Does NOT consult the opening book — used for position analysis only.
+pub fn best_mv_with_score(
+    b:    &Board,
+    color: Color,
+    ep:   Option<(usize,usize)>,
+    cast: &Castle,
+    depth: u8,
+) -> (Option<Mv>, i32) {
+    let moves = legal(b, color, ep, cast);
+    if moves.is_empty() {
+        return (None, evaluate(b));
+    }
+    let is_max   = color == Color::White;
+    let mut bval = if is_max { i32::MIN } else { i32::MAX };
+    let mut best: Option<Mv> = None;
+    for mv in &moves {
+        let (nb, ne, nc) = apply(b, mv, ep, cast);
+        let v = minimax(&nb, depth.saturating_sub(1), i32::MIN, i32::MAX, !is_max, ne, &nc);
+        if (is_max && v > bval) || (!is_max && v < bval) {
+            bval = v;
+            best = Some(*mv);
+        }
+    }
+    (best, bval)
+}
+
+/// Returns the top N moves sorted by score (best first), each with its evaluation.
+/// Used by the analysis engine for multi-PV display.
+pub fn top_n_moves(
+    b:     &Board,
+    color: Color,
+    ep:    Option<(usize,usize)>,
+    cast:  &Castle,
+    depth: u8,
+    n:     usize,
+) -> Vec<(Mv, i32)> {
+    let moves = legal(b, color, ep, cast);
+    if moves.is_empty() { return vec![]; }
+    let is_max   = color == Color::White;
+    let mut scored: Vec<(Mv, i32)> = moves.iter().map(|mv| {
+        let (nb, ne, nc) = apply(b, mv, ep, cast);
+        let v = minimax(&nb, depth.saturating_sub(1), i32::MIN, i32::MAX, !is_max, ne, &nc);
+        (*mv, v)
+    }).collect();
+    // Sort: White wants max, Black wants min
+    if is_max {
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+    } else {
+        scored.sort_by(|a, b| a.1.cmp(&b.1));
+    }
+    scored.truncate(n);
+    scored
+}

@@ -91,9 +91,9 @@ impl PieceStyle {
     ];
     pub fn name(self) -> &'static str {
         match self {
-            PieceStyle::Unicode    => "Unicode symbols  ♔♕♖♗♘♙",
+            PieceStyle::Unicode    => "Unicode symbols  \u{2654}\u{2655}\u{2656}\u{2657}\u{2658}\u{2659}",
             PieceStyle::Letters    => "ASCII letters    K Q R B N P",
-            PieceStyle::FatLetters => "Bracketed        [K][Q][R]…",
+            PieceStyle::FatLetters => "Bracketed        [K][Q][R]\u{2026}",
         }
     }
     pub fn render(self, sym: &'static str, letter: char, is_white: bool) -> String {
@@ -143,7 +143,7 @@ impl MoveHints {
     pub const ALL: &'static [MoveHints] = &[MoveHints::Dots, MoveHints::Highlight, MoveHints::None];
     pub fn name(self) -> &'static str {
         match self {
-            MoveHints::Dots      => "Dots       (· on target squares)",
+            MoveHints::Dots      => "Dots       (\u{b7} on target squares)",
             MoveHints::Highlight => "Highlight  (full square glow)",
             MoveHints::None      => "Off        (no hints)",
         }
@@ -152,20 +152,11 @@ impl MoveHints {
 
 // ── TimeControl ───────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TimeControl {
-    Infinite,           // no clock
-    Bullet,             // 1 min each
-    Blitz,              // 3 min each
-    Rapid,              // 10 min each
-    Classical,          // 30 min each
-}
+pub enum TimeControl { Infinite, Bullet, Blitz, Rapid, Classical }
 impl TimeControl {
     pub const ALL: &'static [TimeControl] = &[
-        TimeControl::Infinite,
-        TimeControl::Bullet,
-        TimeControl::Blitz,
-        TimeControl::Rapid,
-        TimeControl::Classical,
+        TimeControl::Infinite, TimeControl::Bullet, TimeControl::Blitz,
+        TimeControl::Rapid,    TimeControl::Classical,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -176,7 +167,6 @@ impl TimeControl {
             TimeControl::Classical => "Classical  (30 min each)",
         }
     }
-    /// Initial time in milliseconds for each player. None = infinite.
     pub fn initial_ms(self) -> Option<u64> {
         match self {
             TimeControl::Infinite  => None,
@@ -188,7 +178,7 @@ impl TimeControl {
     }
     pub fn short_label(self) -> &'static str {
         match self {
-            TimeControl::Infinite  => "∞",
+            TimeControl::Infinite  => "\u{221e}",
             TimeControl::Bullet    => "1'",
             TimeControl::Blitz     => "3'",
             TimeControl::Rapid     => "10'",
@@ -197,34 +187,91 @@ impl TimeControl {
     }
 }
 
+// ── UiMode ────────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UiMode {
+    /// Original clean UI — no engine panel shown.
+    Minimal,
+    /// Current UI + compact two-line eval bar (default).
+    Standard,
+    /// Full engine analysis panel with eval arrow, bar, and best move.
+    Analysis,
+}
+impl UiMode {
+    pub const ALL: &'static [UiMode] = &[UiMode::Minimal, UiMode::Standard, UiMode::Analysis];
+    pub fn name(self) -> &'static str {
+        match self {
+            UiMode::Minimal  => "Minimal   (no engine info)",
+            UiMode::Standard => "Standard  (compact eval)",
+            UiMode::Analysis => "Analysis  (full panel)",
+        }
+    }
+}
+
+// ── AnalysisEngine ────────────────────────────────────────────────────────────
+/// Which analysis backend to use.
+///
+/// Arch:    sudo pacman -S stockfish
+/// Ubuntu:  sudo apt install stockfish
+/// macOS:   brew install stockfish
+///
+/// If Stockfish is selected but not found, the game falls back to
+/// the Built-in engine automatically.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnalysisEngine {
+    /// Pure-Rust minimax at depth 2 — always available, no install needed.
+    Builtin,
+    /// Stockfish via UCI protocol — must be installed separately.
+    Stockfish,
+}
+impl AnalysisEngine {
+    pub const ALL: &'static [AnalysisEngine] = &[AnalysisEngine::Builtin, AnalysisEngine::Stockfish];
+    pub fn name(self) -> &'static str {
+        match self {
+            AnalysisEngine::Builtin   => "Built-in  (minimax, always works)",
+            AnalysisEngine::Stockfish => "Stockfish (pacman -S stockfish)",
+        }
+    }
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    pub theme:        Theme,
-    pub piece_style:  PieceStyle,
-    pub ai_depth:     AiDepth,
-    pub move_hints:   MoveHints,
-    pub time_control: TimeControl,
-    pub show_coords:  bool,
-    pub show_clock:   bool,       // show move counter
-    pub flip_board:   bool,       // always flip (manual)
-    pub auto_flip:    bool,       // auto-flip in two-player each turn
-    pub confirm_move: bool,
+    pub theme:           Theme,
+    pub piece_style:     PieceStyle,
+    pub ai_depth:        AiDepth,
+    pub move_hints:      MoveHints,
+    pub time_control:    TimeControl,
+    pub show_coords:     bool,
+    pub show_clock:      bool,
+    pub flip_board:      bool,
+    pub auto_flip:       bool,
+    pub confirm_move:    bool,
+    pub ui_mode:         UiMode,
+    /// Auto-save board PNG when a game ends (default: false)
+    pub auto_save_png:   bool,
+    pub analysis_engine: AnalysisEngine,
+    /// Depth for built-in analysis engine (1=fast, 2=balanced, 3=strong)
+    pub analysis_depth: u8,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            theme:        Theme::Classic,
-            piece_style:  PieceStyle::Unicode,
-            ai_depth:     AiDepth::Hard,
-            move_hints:   MoveHints::Dots,
-            time_control: TimeControl::Infinite,
-            show_coords:  true,
-            show_clock:   true,
-            flip_board:   false,
-            auto_flip:    false,
-            confirm_move: false,
+            theme:           Theme::Classic,
+            piece_style:     PieceStyle::Unicode,
+            ai_depth:        AiDepth::Hard,
+            move_hints:      MoveHints::Dots,
+            time_control:    TimeControl::Infinite,
+            show_coords:     true,
+            show_clock:      true,
+            flip_board:      false,
+            auto_flip:       false,
+            confirm_move:    false,
+            ui_mode:         UiMode::Standard,
+            auto_save_png:   false,
+            analysis_engine: AnalysisEngine::Builtin,
+            analysis_depth: 2,
         }
     }
 }
@@ -267,11 +314,22 @@ impl Config {
                             "classical" => TimeControl::Classical,
                             _           => TimeControl::Infinite,
                         },
-                        "show_coords"  => cfg.show_coords  = val == "true",
-                        "show_clock"   => cfg.show_clock   = val == "true",
-                        "flip_board"   => cfg.flip_board   = val == "true",
-                        "auto_flip"    => cfg.auto_flip    = val == "true",
-                        "confirm_move" => cfg.confirm_move = val == "true",
+                        "show_coords"     => cfg.show_coords  = val == "true",
+                        "show_clock"      => cfg.show_clock   = val == "true",
+                        "flip_board"      => cfg.flip_board   = val == "true",
+                        "auto_flip"       => cfg.auto_flip    = val == "true",
+                        "confirm_move"    => cfg.confirm_move = val == "true",
+                        "ui_mode" => cfg.ui_mode = match val {
+                            "minimal"  => UiMode::Minimal,
+                            "analysis" => UiMode::Analysis,
+                            _          => UiMode::Standard,
+                        },
+                        "auto_save_png"   => cfg.auto_save_png   = val == "true",
+                        "analysis_engine" => cfg.analysis_engine = match val {
+                            "stockfish" => AnalysisEngine::Stockfish,
+                            _           => AnalysisEngine::Builtin,
+                        },
+                        "analysis_depth" => cfg.analysis_depth = val.parse::<u8>().unwrap_or(2).clamp(1, 3),
                         _ => {}
                     }
                 }
@@ -283,17 +341,30 @@ impl Config {
     pub fn save(&self) {
         if let Some(path) = config_path() {
             let _ = fs::write(path, format!(
-                "# RChess TUI — edit here or use in-game Settings (s)\n\n\
-                 theme        = {}\n\
-                 piece_style  = {}\n\
-                 ai_depth     = {}\n\
-                 move_hints   = {}\n\
-                 time_control = {}\n\
-                 show_coords  = {}\n\
-                 show_clock   = {}\n\
-                 flip_board   = {}\n\
-                 auto_flip    = {}\n\
-                 confirm_move = {}\n",
+                "# RChess TUI v0.7 — edit here or use in-game Settings (s)\n\
+                 #\n\
+                 # analysis_engine options:\n\
+                 #   builtin   — pure Rust minimax, always works, no install needed\n\
+                 #   stockfish — install: sudo pacman -S stockfish  (Arch)\n\
+                 #               install: sudo apt install stockfish (Ubuntu)\n\
+                 #               then set: analysis_engine = stockfish\n\
+                 #\n\
+                 # ui_mode options: minimal | standard | analysis\n\
+                 # Press T in-game to cycle ui_mode quickly.\n\n\
+                 theme            = {}\n\
+                 piece_style      = {}\n\
+                 ai_depth         = {}\n\
+                 move_hints       = {}\n\
+                 time_control     = {}\n\
+                 show_coords      = {}\n\
+                 show_clock       = {}\n\
+                 flip_board       = {}\n\
+                 auto_flip        = {}\n\
+                 confirm_move     = {}\n\
+                 ui_mode          = {}\n\
+                 auto_save_png    = {}\n\
+                 analysis_engine  = {}\n\
+                 analysis_depth   = {}\n",
                 match self.theme {
                     Theme::Classic=>"classic", Theme::Tournament=>"tournament",
                     Theme::Mocha=>"mocha",    Theme::Slate=>"slate",
@@ -315,13 +386,28 @@ impl Config {
                 },
                 self.show_coords, self.show_clock, self.flip_board,
                 self.auto_flip,   self.confirm_move,
+                match self.ui_mode {
+                    UiMode::Minimal=>"minimal", UiMode::Standard=>"standard",
+                    UiMode::Analysis=>"analysis",
+                },
+                self.auto_save_png,
+                match self.analysis_engine {
+                    AnalysisEngine::Builtin=>"builtin",
+                    AnalysisEngine::Stockfish=>"stockfish",
+                },
+                self.analysis_depth,
             ));
         }
     }
 }
 
+// ── Config path: ~/.config/rchess/rchess_tui.conf ────────────────────────────
 fn config_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(|h| PathBuf::from(h).join(".rchess_tui.conf"))
+        .map(|h| {
+            let dir = PathBuf::from(h).join(".config").join("rchess");
+            let _ = fs::create_dir_all(&dir);
+            dir.join("rchess_tui.conf")
+        })
 }
