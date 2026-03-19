@@ -2,7 +2,7 @@
 
 # ♟ rchess
 
-A chess game that lives in your terminal. Pure Rust, no dependencies beyond a keyboard.
+A chess game that lives in your terminal. Pure Rust.
 
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange?logo=rust)](https://rustup.rs)
 [![License](https://img.shields.io/badge/license-MIT-green)](#)
@@ -26,6 +26,14 @@ cd rchess
 cargo build --release
 ./target/release/rchess
 ```
+OR (simple one liner) 
+
+```bash
+
+cargo install --git https://github.com/tonycth7/rchess
+
+rchess 
+```
 
 That's it. Zero extra installs to play.
 
@@ -34,7 +42,8 @@ That's it. Zero extra installs to play.
 ```bash
 sudo pacman -S python-pillow   # PNG board export
 sudo pacman -S stockfish       # stronger move analysis
-sudo pacman -S ttf-freefont    # Unicode chess symbols in PNG (♔♕♖)
+#optional (if you don't have nerd font)
+sudo pacman -S ttf-freefont    # Unicode chess symbols in PNG (♔♕♖) 
 ```
 
 ---
