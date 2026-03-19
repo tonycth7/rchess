@@ -1,6 +1,6 @@
 <div align="center">
 
-# ♟ rchess
+# ♟ rChess
 
 A chess game that lives in your terminal. Pure Rust.
 
@@ -13,92 +13,127 @@ A chess game that lives in your terminal. Pure Rust.
 
 ## What it is
 
-rchess is a fully playable terminal chess game. Play against a friend, fight the built-in AI, get your moves analysed in real time, replay games, and export board snapshots as PNG — all from your terminal, all without leaving the keyboard (though mouse support is there if you want it).
+rchess is a fully playable terminal chess game.
+
+Play against a friend, fight the built-in AI, get your moves analysed in real time, replay games, and export board snapshots as PNG — all without leaving the keyboard (mouse support included if you want it).
 
 ---
 
-## Getting started
+## Install
+
+### Quick install (Cargo)
 
 ```bash
-# You need Rust — get it at rustup.rs if you don't have it
-git clone https://github.com/yourname/rchess
+cargo install --git https://github.com/tonycth7/rchess
+rchess
+````
+
+### Build from source
+
+```bash
+git clone https://github.com/tonycth7/rchess
 cd rchess
 cargo build --release
 ./target/release/rchess
 ```
-OR (simple one liner) 
+
+---
+
+## Full feature support
+
+If you want **everything working (analysis + PNG export):**
 
 ```bash
-
-cargo install --git https://github.com/tonycth7/rchess
-
-rchess 
-```
-
-That's it. Zero extra installs to play.
-
-**Want more features?**
-
-```bash
-sudo pacman -S python-pillow   # PNG board export
 sudo pacman -S stockfish       # stronger move analysis
-#optional (if you don't have nerd font)
-sudo pacman -S ttf-freefont    # Unicode chess symbols in PNG (♔♕♖) 
+sudo pacman -S python-pillow   # PNG board export
 ```
+
+### Optional
+
+```bash
+# if you don't have a Nerd Font
+sudo pacman -S ttf-freefont    # Unicode chess symbols (♔♕♖)
+```
+
+---
+
+## AUR (coming soon)
+
+```bash
+# paru
+paru -S rchess
+
+# yay
+yay -S rchess
+```
+
+> Not published yet — PKGBUILD will be added soon.
 
 ---
 
 ## Playing
 
-Navigate with arrow keys or `hjkl`. Click a piece, click the destination. Or just type the move — `e2e4`, `Nf3`, `O-O` — an input bar appears automatically as soon as you start typing.
+Navigate with arrow keys or `hjkl`.
 
-| Key | What it does |
-|-----|-------------|
-| `hjkl` / arrows | Move cursor |
-| `Enter` / click | Select & move |
-| Type a move | `e2e4`, `Nf3`, `O-O`, `O-O-O` |
-| `u` | Undo |
-| `r` | Replay the game |
-| `E` (Shift) | Export board as PNG |
-| `T` (Shift) | Cycle analysis panel |
-| `d` | Offer draw (PvP only) |
-| `s` | Settings |
-| `q` | Main menu |
+* Select a piece → select destination
+* Or type moves directly: `e2e4`, `Nf3`, `O-O`
+* Input bar appears automatically when typing
+
+| Key             | What it does                  |
+| --------------- | ----------------------------- |
+| `hjkl` / arrows | Move cursor                   |
+| `Enter` / click | Select & move                 |
+| Type a move     | `e2e4`, `Nf3`, `O-O`, `O-O-O` |
+| `u`             | Undo                          |
+| `r`             | Replay the game               |
+| `E` (Shift)     | Export board as PNG           |
+| `T` (Shift)     | Cycle analysis panel          |
+| `d`             | Offer draw (PvP only)         |
+| `s`             | Settings                      |
+| `q`             | Main menu                     |
 
 ---
 
 ## Move analysis
 
-After every move, a background engine quietly labels what just happened:
+After every move, a background engine labels what just happened:
 
-| | Label | Meaning |
-|-|-------|---------|
-| `B` | Book | Known opening line |
-| `+` | Good | Sound move |
-| `?!` | Inaccuracy | Small slip |
-| `?` | Mistake | Significant error |
-| `??` | Blunder | Serious mistake |
+|      | Label      | Meaning            |
+| ---- | ---------- | ------------------ |
+| `B`  | Book       | Known opening line |
+| `+`  | Good       | Sound move         |
+| `?!` | Inaccuracy | Small slip         |
+| `?`  | Mistake    | Significant error  |
+| `??` | Blunder    | Serious mistake    |
 
-Labels appear in the history panel as they arrive — the UI never freezes for analysis.
+* Updates appear **live** in the history panel
+* UI never freezes during analysis
 
-Press `T` to cycle through **Minimal** (no engine info), **Standard** (compact label bar), and **Analysis** (full panel with top 3 candidate moves, eval before → after, and a sparkline across the whole game in Replay).
+Press `T` to switch modes:
+
+* **Minimal** — no engine info
+* **Standard** — compact labels
+* **Analysis** — full engine panel (top moves, eval change, replay graph)
+
+---
 
 ### Engine options
 
-The built-in engine always works with no install. Stockfish is optional but much stronger.
+The built-in engine works out of the box. Stockfish is optional but much stronger.
 
-| Engine | Typical speed | How to use |
-|--------|--------------|-----------|
-| Built-in depth 1 | ~1ms | Default |
-| Built-in depth 2 | ~5–50ms | Settings → Analysis depth |
-| Built-in depth 3 | ~50–500ms | Settings → Analysis depth |
-| Stockfish | 300ms/position | `sudo pacman -S stockfish`, then Settings |
+| Engine           | Typical speed   | How to use                   |
+| ---------------- | --------------- | ---------------------------- |
+| Built-in depth 1 | ~1ms            | Default                      |
+| Built-in depth 2 | ~5–50ms         | Settings → Analysis depth    |
+| Built-in depth 3 | ~50–500ms       | Settings → Analysis depth    |
+| Stockfish        | ~300ms/position | Install + enable in settings |
 
 ---
 
 ## Config
 
-Press `s` → Settings → `w` to save. Or edit the file directly — it's picked up on next launch.
+Press `s` → Settings → `w` to save
+Or edit manually:
 
 ```ini
 # ~/.config/rchess/rchess_tui.conf
@@ -109,52 +144,76 @@ time_control    = infinite     # infinite bullet blitz rapid classical
 ui_mode         = standard     # minimal standard analysis
 analysis_engine = builtin      # builtin stockfish
 analysis_depth  = 2            # 1=fast  2=balanced  3=strong
-auto_save_png   = false        # set true to auto-save a PNG when each game ends
+auto_save_png   = false        # auto-save PNG on game end
 ```
 
 ---
 
 ## PNG export
 
-Hit `Shift+E` during a game, preview the board, press `Y`. Saves to `~/rchess_export/`.
+Press `Shift+E` during a game → preview → `Y`
 
-The renderer detects fonts with chess glyphs via `fc-list` — your Nerd Font will likely work automatically. Falls back to geometric circles with letters if nothing suitable is found.
+Saved to:
+
+```
+~/rchess_export/
+```
+
+* Detects fonts via `fc-list`
+* Uses Nerd Font if available
+* Falls back to geometric pieces if not
 
 ---
 
 ## Opening book
 
-The CPU plays from a built-in book covering the first ~15 moves of the most common openings: Ruy López, Sicilian, French, Caro-Kann, Queen's Gambit, King's Indian, Nimzo-Indian, London, Réti, English, and more. The current opening name shows in the top bar while you're in book — `[Sicilian — Najdorf]`, `[Ruy López — Berlin]`, etc.
+Built-in opening book (~15 moves):
+
+* Ruy López, Sicilian, French, Caro-Kann
+* Queen’s Gambit, King’s Indian, Nimzo-Indian
+* London, Réti, English
+
+Live display:
+
+```
+[Sicilian — Najdorf]
+```
 
 ---
 
 ## Files saved automatically
 
-Everything lands in `~/rchess_export/`:
+```
+~/rchess_export/
+├── *.pgn   # saved games
+└── *.png   # board snapshots
+```
 
-- **PGN** — saved when the game ends
-- **PNG** — saved when you press `Shift+E`, or on game end if `auto_save_png = true`
+* PGN → saved on game end
+* PNG → manual or auto (`auto_save_png = true`)
 
 ---
 
 ## Debugging
 
-All internal logs go to `/tmp/rchess.log` — never to the terminal.
+Logs are written to:
 
 ```bash
 tail -f /tmp/rchess.log
 ```
 
+Never pollutes the terminal UI.
+
 ---
 
 ## Requirements
 
-| | Version | Notes |
-|-|---------|-------|
-| Rust + Cargo | 1.70+ | [rustup.rs](https://rustup.rs) |
-| Terminal size | 115 × 32+ | Works smaller in Minimal mode |
-| Python + Pillow | any | PNG export only, optional |
-| Stockfish | any | Move analysis only, optional |
+|                 | Version   | Notes                                  |
+| --------------- | --------- | -------------------------------------- |
+| Rust + Cargo    | 1.70+     | [https://rustup.rs](https://rustup.rs) |
+| Terminal        | 115 × 32+ | Smaller works in Minimal mode          |
+| Stockfish       | optional  | Strong analysis                        |
+| Python + Pillow | optional  | PNG export                             |
 
 ---
 
@@ -171,3 +230,6 @@ tail -f /tmp/rchess.log
 ![rchess exported PNG](assets/rchess_board2.png)
 
 </div>
+```
+
+---
