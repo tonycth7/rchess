@@ -26,7 +26,7 @@ fn main() -> io::Result<()> {
         match arg.as_str() {
             "-v" | "--version" | "-V" => {
                 println!("RChess-tui v{}", VERSION);
-                println!("Features: opening book, PGN export, draw offers, replay, mouse");
+                println!("Features: opening book, draw offers, replay, mouse");
                 println!("Built with ratatui 0.27 + crossterm 0.27");
                 return Ok(());
             }
