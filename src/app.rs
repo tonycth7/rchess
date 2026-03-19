@@ -9,7 +9,7 @@ use crate::engine::*;
 use crate::ai::best_mv;
 use crate::config::{Config, TimeControl, UiMode};
 
-pub const VERSION: &str = "0.7.0";
+pub const VERSION: &str = "0.7.3";
 
 // ── Screens ───────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -19,6 +19,10 @@ pub enum Screen {
     DrawOffer,
     Replay,
     PngPreview,
+    FenInput,      // Start from a FEN string
+    Puzzle,        // Lichess daily puzzle
+    PgnImport,     // Load a PGN file
+    PgnSaved,      // PGN save confirmation popup
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,6 +47,8 @@ pub struct HistEntry {
     pub color:    Color,
     pub from:     (usize, usize),
     pub to:       (usize, usize),
+    /// Time taken for this move in milliseconds
+    pub move_time_ms: u64,
 }
 
 // ── Move classification ───────────────────────────────────────────────────────
@@ -54,10 +60,13 @@ impl MoveLabel {
     ///          = (eval_before_white - eval_after_white) for Black mover.
     /// Negative delta = bad move.
     pub fn from_delta_cp(delta_cp: i32) -> Self {
-        if      delta_cp > -50  { MoveLabel::Good }
-        else if delta_cp > -100 { MoveLabel::Inaccuracy }
-        else if delta_cp > -300 { MoveLabel::Mistake }
-        else                    { MoveLabel::Blunder }
+        Self::from_delta_cp_thresholds(delta_cp, 50, 100, 300)
+    }
+    pub fn from_delta_cp_thresholds(delta_cp: i32, inaccuracy: i32, mistake: i32, blunder: i32) -> Self {
+        if      delta_cp > -inaccuracy { MoveLabel::Good }
+        else if delta_cp > -mistake   { MoveLabel::Inaccuracy }
+        else if delta_cp > -blunder   { MoveLabel::Mistake }
+        else                          { MoveLabel::Blunder }
     }
     pub fn icon(self) -> &'static str {
         match self {
@@ -165,6 +174,7 @@ pub struct App {
     pub replay_result: String,
     // Export
     pub pgn_saved_path:   Option<String>,
+    pub pgn_notice:       Option<u8>,  // countdown for "PGN saved" banner
     pub png_export_path:  Option<String>,
     pub png_notice:       Option<u8>,
     pub png_preview_path: Option<PathBuf>,
@@ -176,6 +186,8 @@ pub struct App {
     // Analysis engine (background, always running)
     pub analysis:     crate::analysis::AnalysisHandle,
     pub engine_busy:  bool,
+    /// Queued analysis to fire once engine is free (move_idx, uci_before, uci_after, color)
+    pending_analysis: Option<(usize, String, String, crate::engine::Color)>,
     // Move review data
     pub move_reviews: Vec<MoveReview>,
     // Latest White-positive eval in centipawns
@@ -189,12 +201,23 @@ pub struct App {
     pub game_end:     GameEnd,
     pub board_col_off: usize,
     pub board_row_off: usize,
+    // FEN input screen
+    pub fen_input_buf:   String,
+    pub fen_input_err:   Option<String>,
+    // PGN import screen
+    pub pgn_input_buf:   String,
+    pub pgn_input_err:   Option<String>,
+    // Puzzle
+    pub puzzle:          Option<crate::puzzle::Puzzle>,
+    pub puzzle_state:    crate::puzzle::PuzzleState,
+    pub puzzle_move_idx: usize,
+    pub puzzle_rx:       Option<std::sync::mpsc::Receiver<Result<crate::puzzle::Puzzle, String>>>,
 }
 
 impl App {
     pub fn new() -> Self {
         let cfg = Config::load();
-        let analysis = crate::analysis::AnalysisHandle::spawn(cfg.analysis_engine, cfg.analysis_depth);
+        let analysis = crate::analysis::AnalysisHandle::spawn(cfg.analysis_engine, cfg.analysis_depth, cfg.stockfish_skill);
         Self {
             screen: Screen::Menu, mode: Mode::PvP,
             player_color: Color::White, gs: Gs::new(cfg.time_control), cfg,
@@ -204,18 +227,25 @@ impl App {
             menu_cur: 0, color_cur: 0, settings_cur: 0,
             draw_offer: None, draw_offer_msg: None,
             replay_snaps: vec![], replay_idx: 0, replay_result: String::new(),
-            pgn_saved_path: None, png_export_path: None,
+            pgn_saved_path: None, pgn_notice: None, png_export_path: None,
             png_notice: None, png_preview_path: None,
             last_tick: Instant::now(),
             thinking: false, ai_rx: None,
             analysis,
             engine_busy: false,
+            pending_analysis: None,
             move_reviews: vec![],
             last_eval_cp: 0,
             eval_history: vec![0],  // start with balanced
             should_quit: false, saved_notice: None, undo_stack: vec![],
             game_end: GameEnd::Normal,
             board_col_off: 4, board_row_off: 3,
+            fen_input_buf: String::new(), fen_input_err: None,
+            pgn_input_buf: String::new(), pgn_input_err: None,
+            puzzle: None,
+            puzzle_state: crate::puzzle::PuzzleState::Loading,
+            puzzle_move_idx: 0,
+            puzzle_rx: None,
         }
     }
 
@@ -238,11 +268,12 @@ impl App {
         self.thinking = false; self.ai_rx = None;
         self.undo_stack.clear();
         self.draw_offer = None; self.draw_offer_msg = None;
-        self.pgn_saved_path = None;
+        self.pgn_saved_path = None; self.pgn_notice = None;
         self.png_export_path = None; self.png_notice = None; self.png_preview_path = None;
         self.replay_snaps.clear(); self.game_end = GameEnd::Normal;
         self.last_tick = Instant::now();
         self.engine_busy = false;
+        self.pending_analysis = None;
         self.move_reviews.clear();
         self.last_eval_cp = 0;
         self.eval_history = vec![0];
@@ -276,6 +307,7 @@ impl App {
         self.poll_minimax();
         self.poll_analysis();
         if let Some(n) = self.saved_notice { self.saved_notice = if n == 0 { None } else { Some(n - 1) }; }
+        if let Some(n) = self.pgn_notice   { self.pgn_notice   = if n == 0 { None } else { Some(n - 1) }; }
         if let Some(n) = self.png_notice   { self.png_notice   = if n == 0 { None } else { Some(n - 1) }; }
     }
 
@@ -319,7 +351,12 @@ impl App {
         let label = if is_book {
             MoveLabel::Book
         } else {
-            MoveLabel::from_delta_cp(delta_cp)
+            MoveLabel::from_delta_cp_thresholds(
+                delta_cp,
+                self.cfg.inaccuracy_cp,
+                self.cfg.mistake_cp,
+                self.cfg.blunder_cp,
+            )
         };
 
         let san = self.gs.history.get(move_idx)
@@ -331,6 +368,10 @@ impl App {
             move_idx, san, result.eval_before_cp, result.eval_after_cp, delta_cp, label, is_book
         );
 
+        // Sound bell on blunder
+        if label == MoveLabel::Blunder {
+            print!("\x07"); use std::io::Write; let _ = std::io::stdout().flush();
+        }
         let review = MoveReview {
             san,
             eval_before:  result.eval_before_cp as f32 / 100.0,
@@ -351,6 +392,13 @@ impl App {
                 });
             }
             self.move_reviews.push(review);
+        }
+
+        // Fire any queued analysis now that engine is free
+        if let Some((mi, ub, ua, cm)) = self.pending_analysis.take() {
+            rlog!("[rchess/analysis] firing pending move {}", mi);
+            self.analysis.analyse(mi, &ub, &ua, cm, self.cfg.analysis_depth);
+            self.engine_busy = true;
         }
     }
 
@@ -380,20 +428,20 @@ impl App {
 
     fn queue_analysis_after_move(&mut self) {
         if self.cfg.ui_mode == UiMode::Minimal { return; }
-        if self.engine_busy {
-            rlog!("[rchess/analysis] busy — skipping move {}",
-                self.gs.history.len().saturating_sub(1));
-            return;
-        }
         let h = &self.gs.history;
-        let move_idx    = h.len() - 1;
-        let color_moved = h[move_idx].color;
+        let move_idx    = h.len().saturating_sub(1);
+        let color_moved = h.last().map(|e| e.color).unwrap_or(Color::White);
         let uci_before: String = h[..move_idx].iter()
             .map(|e| e.notation.trim_end_matches(['+', '#']).to_string())
             .collect::<Vec<_>>().join(" ");
         let uci_after: String = h.iter()
             .map(|e| e.notation.trim_end_matches(['+', '#']).to_string())
             .collect::<Vec<_>>().join(" ");
+        if self.engine_busy {
+            rlog!("[rchess/analysis] engine busy — queuing move {} for later", move_idx);
+            self.pending_analysis = Some((move_idx, uci_before, uci_after, color_moved));
+            return;
+        }
         rlog!("[rchess/analysis] queuing move {} ({:?})", move_idx, color_moved);
         self.analysis.analyse(move_idx, &uci_before, &uci_after, color_moved, self.cfg.analysis_depth);
         self.engine_busy = true;
@@ -527,7 +575,7 @@ impl App {
         let path = dir.join(format!("rchess_{}.pgn", self.gs.fullmove));
         rlog!("[rchess] PGN: {}", path.display());
         match fs::write(&path, &pgn) {
-            Ok(_)  => self.pgn_saved_path = Some(path.to_string_lossy().to_string()),
+            Ok(_)  => { self.pgn_saved_path = Some(path.to_string_lossy().to_string()); self.pgn_notice = Some(80); }
             Err(e) => { rlog!("[rchess] PGN write error: {}", e); },
         }
     }
@@ -605,11 +653,14 @@ impl App {
     pub fn handle_menu_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Up   | KeyCode::Char('k') => { if self.menu_cur > 0 { self.menu_cur -= 1; } }
-            KeyCode::Down | KeyCode::Char('j') => { if self.menu_cur < 2 { self.menu_cur += 1; } }
+            KeyCode::Down | KeyCode::Char('j') => { if self.menu_cur < 5 { self.menu_cur += 1; } }
             KeyCode::Enter | KeyCode::Char(' ') => match self.menu_cur {
                 0 => { self.mode = Mode::PvP; self.player_color = Color::White; self.start_game(); }
                 1 => { self.mode = Mode::CPU; self.screen = Screen::ColorPick; }
                 2 => self.screen = Screen::Settings,
+                3 => self.open_fen_input(),
+                4 => self.open_pgn_import(),
+                5 => self.open_puzzle(),
                 _ => {}
             },
             KeyCode::Char('s') => self.screen = Screen::Settings,
@@ -717,6 +768,8 @@ impl App {
             KeyCode::Char('s') => self.screen = Screen::Settings,
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('E') => self.open_png_preview(),
+            // G (Shift+G) = save PGN game notation manually
+            KeyCode::Char('G') => { self.export_pgn(); if self.pgn_saved_path.is_some() { self.screen = Screen::PgnSaved; } }
             KeyCode::Char('r') => { if !self.replay_snaps.is_empty() { self.open_replay(); } }
             // T = cycle UI mode without going to settings
             KeyCode::Char('T') => {
@@ -792,6 +845,7 @@ impl App {
             KeyCode::Char('0') | KeyCode::Home => self.replay_idx = 0,
             KeyCode::Char('$') | KeyCode::End  => self.replay_idx = self.replay_snaps.len().saturating_sub(1),
             KeyCode::Char('E')                  => self.open_png_preview(),
+            KeyCode::Char('G')                  => { self.export_pgn(); if self.pgn_saved_path.is_some() { self.screen = Screen::PgnSaved; } }
             KeyCode::Char('q') | KeyCode::Esc  => self.screen = Screen::Game,
             _ => {}
         }
@@ -813,10 +867,12 @@ impl App {
 
     // ── Mouse ─────────────────────────────────────────────────────────────────
     pub fn handle_mouse_click(&mut self, col: usize, row: usize) {
-        if self.screen != Screen::Game { return; }
+        // Allow puzzle screen to handle mouse too
+        let is_puzzle = self.screen == Screen::Puzzle;
+        if self.screen != Screen::Game && !is_puzzle { return; }
         let over  = matches!(self.gs.status, Status::Checkmate | Status::Stalemate)
                     || self.gs.clock_state == ClockState::Flagged;
-        let human = self.mode == Mode::PvP || self.gs.turn == self.player_color;
+        let human = is_puzzle || self.mode == Mode::PvP || self.gs.turn == self.player_color;
         if !human || over || self.thinking { return; }
         // These MUST match CELL_W and CELL_H in ui.rs
         const CELL_W: usize = 9; const CELL_H: usize = 5;
@@ -859,7 +915,17 @@ impl App {
                 }
                 if let Some(&mv) = self.targets.iter().find(|m| m.fr == sel && m.to == bc && m.promo.is_none()) {
                     self.selected = None; self.targets = vec![];
-                    self.execute(mv);
+                    if self.screen == Screen::Puzzle {
+                        // Puzzle: validate move against solution
+                        let ff = (b'a' + sel.1 as u8) as char; let fr = 8 - sel.0;
+                        let tf = (b'a' + bc.1  as u8) as char; let tr = 8 - bc.0;
+                        let expected = self.puzzle.as_ref()
+                            .and_then(|p| p.moves.get(self.puzzle_move_idx))
+                            .cloned().unwrap_or_default();
+                        self.check_puzzle_move(&expected, &format!("{}{}{}{}", ff, fr, tf, tr));
+                    } else {
+                        self.execute(mv);
+                    }
                 }
                 return;
             }
@@ -936,10 +1002,17 @@ impl App {
         let coord_note = format!("{}{}{}{}{}{}", ff, fr, tf, tr, ps, sfx);
         let san_full   = format!("{}{}", san, sfx);
 
+        let move_time_ms = self.last_tick.elapsed().as_millis() as u64;
         self.gs.history.push(HistEntry {
             notation: coord_note, san: san_full,
             color: piece.c, from: mv.fr, to: mv.to,
+            move_time_ms,
         });
+        // Sound: bell on check or game events (non-blocking, ignored if terminal has no bell)
+        match new_s {
+            Status::Check | Status::Checkmate => { print!("\x07"); use std::io::Write; let _ = std::io::stdout().flush(); }
+            _ => {}
+        }
         self.gs.board = nb; self.gs.turn = next;
         self.gs.ep = ne; self.gs.cast = nc; self.gs.status = new_s;
         if next == Color::White { self.gs.fullmove += 1; }
@@ -976,9 +1049,328 @@ impl App {
             self.finish_game();
         }
     }
+
+    // ── FEN Import ────────────────────────────────────────────────────────────
+    pub fn open_fen_input(&mut self) {
+        self.fen_input_buf.clear();
+        self.fen_input_err = None;
+        self.screen = Screen::FenInput;
+    }
+
+    pub fn handle_fen_input_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c)   => { self.fen_input_buf.push(c); self.fen_input_err = None; }
+            KeyCode::Backspace => { self.fen_input_buf.pop(); self.fen_input_err = None; }
+            KeyCode::Esc       => { self.screen = Screen::Menu; }
+            KeyCode::Enter     => {
+                let fen = self.fen_input_buf.trim().to_string();
+                match crate::puzzle::parse_fen(&fen) {
+                    Ok((board, turn, ep, cast, fullmove)) => {
+                        self.gs = Gs::new(self.cfg.time_control);
+                        self.gs.board    = board;
+                        self.gs.turn     = turn;
+                        self.gs.ep       = ep;
+                        self.gs.cast     = cast;
+                        self.gs.fullmove = fullmove;
+                        self.fen_input_buf.clear();
+                        self.fen_input_err = None;
+                        self.screen = Screen::Game;
+                        self.selected = None; self.targets = vec![];
+                        self.thinking = false; self.ai_rx = None;
+                        self.move_reviews.clear(); self.eval_history = vec![0];
+                        self.replay_snaps.clear();
+                        self.replay_snaps.push(ReplaySnap {
+                            board: self.gs.board, turn: self.gs.turn,
+                            notation: String::new(), mv_num: fullmove,
+                        });
+                        if self.mode == Mode::CPU && self.gs.turn != self.player_color {
+                            self.kick_ai();
+                        }
+                    }
+                    Err(e) => {
+                        self.fen_input_err = Some(format!("Invalid FEN: {}", e));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── PGN Import ────────────────────────────────────────────────────────────
+    pub fn open_pgn_import(&mut self) {
+        self.pgn_input_buf.clear();
+        self.pgn_input_err = None;
+        self.screen = Screen::PgnImport;
+    }
+
+    /// Load a PGN game (by text or file path) and open replay.
+    fn load_and_replay_pgn(&mut self, game: crate::pgn_import::PgnGame) {
+        self.mode = Mode::PvP;
+        self.player_color = Color::White;
+        self.start_game();
+        let moves = game.uci_moves.clone();
+        for uci in &moves {
+            match parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, uci) {
+                Ok(m)  => self.execute(m),
+                Err(e) => { rlog!("[rchess/pgn] move error {}: {}", uci, e); break; }
+            }
+        }
+        self.pgn_input_buf.clear();
+        self.pgn_input_err = None;
+        self.open_replay();
+    }
+
+    pub fn handle_pgn_import_key(&mut self, code: KeyCode) {
+        match code {
+            // Regular character typing
+            KeyCode::Char(c) => {
+                self.pgn_input_buf.push(c);
+                self.pgn_input_err = None;
+            }
+            // Newline in pasted PGN — accept it as part of the text
+            KeyCode::Enter => {
+                let text = self.pgn_input_buf.trim().to_string();
+                if text.is_empty() { return; }
+
+                // Detect: does it look like a file path or raw PGN text?
+                let is_path = !text.contains('[') && !text.contains(' ')
+                    || text.starts_with('/') || text.starts_with('~');
+
+                let result = if is_path {
+                    let path = shellexpand_tilde(&text);
+                    crate::pgn_import::load_pgn_file(&path)
+                } else {
+                    crate::pgn_import::parse_pgn(&text)
+                };
+
+                match result {
+                    Ok(game) => self.load_and_replay_pgn(game),
+                    Err(e)   => self.pgn_input_err = Some(e),
+                }
+            }
+            KeyCode::Backspace => {
+                self.pgn_input_buf.pop();
+                self.pgn_input_err = None;
+            }
+            KeyCode::Esc => { self.screen = Screen::Menu; }
+            _ => {}
+        }
+    }
+
+    // ── Puzzle ────────────────────────────────────────────────────────────────
+    pub fn open_puzzle(&mut self) {
+        self.puzzle       = None;
+        self.puzzle_state = crate::puzzle::PuzzleState::Loading;
+        self.puzzle_move_idx = 0;
+        self.screen       = Screen::Puzzle;
+
+        // Fetch in background thread — capture token before move into thread
+        let cfg_token = self.cfg.lichess_token.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.puzzle_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::puzzle::fetch_daily_puzzle(&cfg_token);
+            let _ = tx.send(result);
+        });
+    }
+
+    pub fn poll_puzzle(&mut self) {
+        // Poll background fetch
+        if self.puzzle_state == crate::puzzle::PuzzleState::Loading {
+            if let Some(rx) = &self.puzzle_rx {
+                if let Ok(result) = rx.try_recv() {
+                    self.puzzle_rx = None;
+                    match result {
+                        Ok(p) => {
+                            rlog!("[rchess/puzzle] loaded puzzle {} rating={}", p.id, p.rating);
+                            self.setup_puzzle(p);
+                        }
+                        Err(e) => {
+                            rlog!("[rchess/puzzle] fetch failed: {}", e);
+                            self.puzzle_state = crate::puzzle::PuzzleState::Failed(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-play setup move after a short delay (once in Setup state)
+        if self.puzzle_state == crate::puzzle::PuzzleState::Setup {
+            if let Some(ref p) = self.puzzle.clone() {
+                if let Some(uci) = p.moves.first() {
+                    let mv = parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, uci);
+                    if let Ok(m) = mv {
+                        self.execute(m);
+                    }
+                }
+                self.puzzle_state = crate::puzzle::PuzzleState::WaitingInput;
+                self.puzzle_move_idx = p.solution_start;
+            }
+        }
+    }
+
+    fn setup_puzzle(&mut self, p: crate::puzzle::Puzzle) {
+        // Parse the puzzle FEN
+        if let Ok((board, turn, ep, cast, fullmove)) = crate::puzzle::parse_fen(&p.fen) {
+            self.gs = Gs::new(self.cfg.time_control);
+            self.gs.board    = board;
+            self.gs.turn     = turn;
+            self.gs.ep       = ep;
+            self.gs.cast     = cast;
+            self.gs.fullmove = fullmove;
+            self.gs.clock_state = ClockState::Paused;
+            self.selected = None; self.targets = vec![];
+            self.move_reviews.clear(); self.eval_history = vec![0];
+            self.replay_snaps.clear();
+            self.replay_snaps.push(ReplaySnap {
+                board: self.gs.board, turn: self.gs.turn,
+                notation: String::new(), mv_num: fullmove,
+            });
+            self.puzzle = Some(p);
+            self.puzzle_state = crate::puzzle::PuzzleState::Setup;
+        } else {
+            self.puzzle_state = crate::puzzle::PuzzleState::Failed("FEN parse failed".to_string());
+        }
+    }
+
+    pub fn handle_puzzle_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.screen = Screen::Menu;
+                return;
+            }
+            KeyCode::Char('n') => {
+                self.open_puzzle();
+                return;
+            }
+            _ => {}
+        }
+
+        // Navigation always works
+        match code {
+            KeyCode::Up    | KeyCode::Char('k') => { if self.cursor.0 > 0 { self.cursor.0 -= 1; } }
+            KeyCode::Down  | KeyCode::Char('j') => { if self.cursor.0 < 7 { self.cursor.0 += 1; } }
+            KeyCode::Left  | KeyCode::Char('h') => { if self.cursor.1 > 0 { self.cursor.1 -= 1; } }
+            KeyCode::Right | KeyCode::Char('l') => { if self.cursor.1 < 7 { self.cursor.1 += 1; } }
+            _ => {}
+        }
+
+        if self.puzzle_state != crate::puzzle::PuzzleState::WaitingInput { return; }
+
+        let p = match &self.puzzle { Some(p) => p.clone(), None => return };
+        let expected_uci = match p.moves.get(self.puzzle_move_idx) {
+            Some(m) => m.clone(),
+            None    => return,
+        };
+
+        // Input: typing notation or selecting
+        if !self.input_buf.is_empty() {
+            match code {
+                KeyCode::Enter => {
+                    let buf = self.input_buf.clone();
+                    self.input_buf.clear(); self.input_err = None;
+                    self.check_puzzle_move(&expected_uci, &buf);
+                }
+                KeyCode::Backspace => { self.input_buf.pop(); }
+                KeyCode::Esc       => { self.input_buf.clear(); self.input_err = None; }
+                KeyCode::Char(c)   => { self.input_buf.push(c); }
+                _ => {}
+            }
+        } else {
+            match code {
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let pos = self.to_board(self.cursor);
+                    if let Some(sel) = self.selected {
+                        if self.targets.iter().any(|m| m.fr == sel && m.to == pos) {
+                            let ff = (b'a' + sel.1 as u8) as char;
+                            let fr = 8 - sel.0;
+                            let tf = (b'a' + pos.1 as u8) as char;
+                            let tr = 8 - pos.0;
+                            let uci_played = format!("{}{}{}{}", ff, fr, tf, tr);
+                            self.selected = None; self.targets = vec![];
+                            self.check_puzzle_move(&expected_uci, &uci_played);
+                        } else {
+                            self.selected = None; self.targets = vec![];
+                        }
+                    } else if self.gs.board[pos.0][pos.1]
+                        .map(|p| p.c == self.gs.turn).unwrap_or(false)
+                    {
+                        let all = legal(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast);
+                        self.selected = Some(pos);
+                        self.targets  = all.into_iter().filter(|m| m.fr == pos).collect();
+                    }
+                }
+                KeyCode::Char(c) => { self.input_buf.push(c); }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_puzzle_move(&mut self, expected_uci: &str, played: &str) {
+        let played_clean = played.trim().to_lowercase();
+        let expected_clean = expected_uci[..4].to_lowercase();
+
+        // Parse played move to canonical UCI
+        let played_uci = match parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, &played_clean) {
+            Ok(mv) => {
+                let ff = (b'a' + mv.fr.1 as u8) as char;
+                let fr = 8 - mv.fr.0;
+                let tf = (b'a' + mv.to.1 as u8) as char;
+                let tr = 8 - mv.to.0;
+                format!("{}{}{}{}", ff, fr, tf, tr)
+            }
+            Err(e) => { self.input_err = Some(e); return; }
+        };
+
+        if played_uci == expected_clean {
+            // Correct! Execute the move
+            if let Ok(mv) = parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, &played_clean) {
+                self.execute(mv);
+            }
+            self.puzzle_move_idx += 1;
+
+            let p = self.puzzle.as_ref().unwrap();
+            if self.puzzle_move_idx >= p.moves.len() {
+                // Solved!
+                self.puzzle_state = crate::puzzle::PuzzleState::Solved;
+                print!("\x07"); use std::io::Write; let _ = std::io::stdout().flush();
+            } else {
+                // Play the opponent's response
+                let p = self.puzzle.as_ref().unwrap().clone();
+                if let Some(opp_uci) = p.moves.get(self.puzzle_move_idx) {
+                    if let Ok(opp_mv) = parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, opp_uci) {
+                        self.execute(opp_mv);
+                        self.puzzle_move_idx += 1;
+                    }
+                }
+                // Check if more human moves remain
+                let p = self.puzzle.as_ref().unwrap();
+                if self.puzzle_move_idx >= p.moves.len() {
+                    self.puzzle_state = crate::puzzle::PuzzleState::Solved;
+                } else {
+                    self.puzzle_state = crate::puzzle::PuzzleState::CorrectMove;
+                    // Reset to WaitingInput after brief display
+                    self.puzzle_state = crate::puzzle::PuzzleState::WaitingInput;
+                }
+            }
+        } else {
+            self.puzzle_state = crate::puzzle::PuzzleState::WrongMove(
+                format!("Expected {}, played {}", expected_uci, played_uci)
+            );
+        }
+    }
+
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Expand leading ~ to $HOME in file paths
+fn shellexpand_tilde(path: &str) -> String {
+    if path.starts_with("~/") || path == "~" {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}{}", home, &path[1..])
+    } else { path.to_string() }
+}
 
 pub fn export_dir() -> PathBuf {
     let base = std::env::var_os("HOME")

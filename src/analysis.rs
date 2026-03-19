@@ -1,4 +1,4 @@
-// src/analysis.rs — Move analysis with two selectable backends
+// src/analysis.rs - Move analysis with two selectable backends
 //
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  BACKEND 1 — Built-in (always works, no install needed)     ║
@@ -79,17 +79,17 @@ pub struct AnalysisHandle {
 impl AnalysisHandle {
     /// Spawn the configured analysis backend.
     /// If Stockfish is requested but not found, falls back to built-in.
-    pub fn spawn(choice: AnalysisEngine, depth: u8) -> Self {
+    pub fn spawn(choice: AnalysisEngine, depth: u8, stockfish_skill: u8) -> Self {
         match choice {
             AnalysisEngine::Stockfish => {
-                if let Some(handle) = try_spawn_stockfish(depth) {
+                if let Some(handle) = try_spawn_stockfish(depth, stockfish_skill) {
                     return handle;
                 }
                 rlog!("[rchess/analysis] Stockfish not found — falling back to built-in d{}", depth);
                 rlog!("[rchess/analysis] Install: sudo pacman -S stockfish");
                 Self::spawn_builtin(depth)
             }
-            AnalysisEngine::Builtin => Self::spawn_builtin(depth),
+            AnalysisEngine::Builtin => { let _ = stockfish_skill; Self::spawn_builtin(depth) },
         }
     }
 
@@ -188,7 +188,7 @@ fn builtin_thread(cmd_rx: Receiver<AnalyseCmd>, res_tx: Sender<AnalysisResult>, 
 // BACKEND 2 — Stockfish UCI
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn try_spawn_stockfish(depth: u8) -> Option<AnalysisHandle> {
+fn try_spawn_stockfish(depth: u8, skill: u8) -> Option<AnalysisHandle> {
     // Test if stockfish exists
     let child = Command::new("stockfish")
         .stdin(Stdio::piped())
@@ -200,9 +200,9 @@ fn try_spawn_stockfish(depth: u8) -> Option<AnalysisHandle> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AnalyseCmd>();
     let (res_tx, res_rx) = mpsc::channel::<AnalysisResult>();
 
-    thread::spawn(move || stockfish_thread(child, cmd_rx, res_tx, depth));
+    thread::spawn(move || stockfish_thread(child, cmd_rx, res_tx, depth, skill));
 
-    rlog!("[rchess/stockfish] engine spawned (movetime {}ms, depth param={})", SF_MOVETIME_MS, depth);
+    rlog!("[rchess/stockfish] engine spawned (movetime {}ms skill={})", SF_MOVETIME_MS, skill);
     Some(AnalysisHandle {
         cmd_tx,
         result_rx: res_rx,
@@ -215,6 +215,7 @@ fn stockfish_thread(
     cmd_rx:     Receiver<AnalyseCmd>,
     res_tx:     Sender<AnalysisResult>,
     _depth:     u8,
+    skill:      u8,
 ) {
     let stdin  = match child.stdin.take()  { Some(s) => s, None => return };
     let stdout = match child.stdout.take() { Some(s) => s, None => return };
@@ -227,6 +228,7 @@ fn stockfish_thread(
     writeln!(w, "setoption name Threads value 1").ok();
     writeln!(w, "setoption name Hash value 16").ok();
     writeln!(w, "setoption name MultiPV value 3").ok();
+    writeln!(w, "setoption name Skill Level value {}", skill.min(20)).ok();
     writeln!(w, "isready").ok();
     w.flush().ok();
 

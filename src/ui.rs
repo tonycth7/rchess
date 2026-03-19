@@ -55,6 +55,10 @@ pub fn render(app: &App, f: &mut Frame) {
         Screen::DrawOffer   => { draw_game(app, f); draw_draw_offer(app, f); }
         Screen::Replay      => draw_replay(app, f),
         Screen::PngPreview  => { draw_game(app, f); draw_png_preview(app, f); }
+        Screen::PgnSaved    => { draw_game(app, f); draw_pgn_saved(app, f); }
+        Screen::FenInput    => draw_fen_input(app, f),
+        Screen::PgnImport   => draw_pgn_import(app, f),
+        Screen::Puzzle      => draw_puzzle(app, f),
     }
 }
 
@@ -68,7 +72,14 @@ fn draw_menu(app: &App, f: &mut Frame) {
         rect,
     );
     let inner = pad(rect, 2, 1);
-    let opts  = ["  ♟  TWO PLAYERS", "  ◈  VS COMPUTER   [AI + Opening Book]", "  ⚙  SETTINGS"];
+    let opts  = [
+        "  ♟  TWO PLAYERS",
+        "  ◈  VS COMPUTER   [AI + Opening Book]",
+        "  ⚙  SETTINGS",
+        "  ≡  START FROM FEN",
+        "  ↥  LOAD PGN FILE",
+        "  ★  DAILY PUZZLE  [Lichess]",
+    ];
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::raw("  "), Span::styled("♔ ♕ ♗ ♘ ♖ ♙", sty(pw(th)).add_modifier(Modifier::BOLD))]),
@@ -155,6 +166,7 @@ fn draw_settings(app: &App, f: &mut Frame) {
         ("Analysis engine", app.cfg.analysis_engine.name()),
         ("Analysis depth",  match app.cfg.analysis_depth { 1=>"1  (fast)", 2=>"2  (balanced)", 3=>"3  (strong)", _=>"2" }),
         ("Auto-save PNG",   if app.cfg.auto_save_png  {"ON  (saves on game end)"} else {"OFF (manual only)"}),
+        ("Lichess token",   if app.cfg.lichess_token.is_empty() {"(none — anonymous)"} else {"(set — see config file)"}),
     ];
     let mut lines = vec![
         Line::from(""),
@@ -265,8 +277,8 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect) {
         )
     };
     let hl_color = |is_light: bool| {
-        let sq = if is_light { th.squares().0 } else { th.squares().1 };
-        Color::Rgb(sq.0.saturating_add(30).min(255), sq.1.saturating_add(30).min(255), sq.2.saturating_add(10).min(255))
+        // Bright highlight: vivid green-teal on dark squares, neon-yellow on light squares
+        if is_light { Color::Rgb(200, 230, 0) } else { Color::Rgb(0, 210, 140) }
     };
 
     let mut lines: Vec<Line> = vec![];
@@ -295,14 +307,18 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect) {
                 let bg = if is_sel       { sel_bg }
                     else if is_kchk      { chk_bg }
                     else if is_cur       { cur_bg }
-                    else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Highlight) && piece.is_none() { hl_color(is_light) }
+                    else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Highlight) { hl_color(is_light) }
+                // Dots mode: tint the square background slightly so dot stands out
+                else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) && piece.is_none() {
+                    if is_light { Color::Rgb(180, 200, 80) } else { Color::Rgb(30, 100, 80) }
+                }
                     else if is_last      { lm_color(is_light) }
                     else if is_light     { sq_l(th) }
                     else                 { sq_d(th) };
 
                 let cell_str = if is_mid {
                     if let Some(p) = piece { center_str(&piece_sym(p,&app.cfg.piece_style), CELL_W) }
-                    else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) { center_str("·", CELL_W) }
+                    else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) { center_str("⬤", CELL_W) }  // U+2B24 large filled circle
                     else { " ".repeat(CELL_W) }
                 } else if line_idx==CELL_H-1 && is_tgt && piece.is_some() {
                     format!("  {:─<width$}  ","",width=CELL_W.saturating_sub(4))
@@ -311,7 +327,10 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect) {
                 let mut style = Style::default().bg(bg);
                 if let Some(p) = piece {
                     style = style.fg(if p.c==PC::White{pw(th)}else{pb_c(th)}).add_modifier(Modifier::BOLD);
-                } else if is_tgt { style = style.fg(TEAL); }
+                } else if is_tgt && matches!(app.cfg.move_hints, MoveHints::Dots) {
+                    // Bright contrasting dot color that pops on any square
+                    style = style.fg(Color::Rgb(0, 255, 160)).add_modifier(Modifier::BOLD);
+                } else if is_tgt { style = style.fg(Color::Rgb(0, 255, 160)).add_modifier(Modifier::BOLD); }
                 spans.push(Span::styled(cell_str, style));
             }
             if app.cfg.show_coords {
@@ -504,10 +523,11 @@ fn draw_status(app: &App, f: &mut Frame, area: Rect) {
     let info_line = if app.png_notice.is_some() {
         let path  = app.png_export_path.as_deref().unwrap_or("");
         let fname = path.split('/').last().unwrap_or(path);
-        (format!("  ✓ PNG: {}", fname), GREEN)
-    } else if let Some(path) = &app.pgn_saved_path {
+        (format!("  + PNG saved: {}", fname), GREEN)
+    } else if app.pgn_notice.is_some() {
+        let path  = app.pgn_saved_path.as_deref().unwrap_or("");
         let fname = path.split('/').last().unwrap_or(path);
-        (format!("  PGN: {}", fname), TEAL)
+        (format!("  + PGN saved: {}", fname), TEAL)
     } else {
         (String::new(), DIMMER)
     };
@@ -559,10 +579,14 @@ fn draw_history(app: &App, f: &mut Frame, area: Rect) {
             let blc = blab.map(|l| label_color(l, th)).unwrap_or(DIMMER);
             let wi  = wlab.map(|l| l.icon()).unwrap_or("");
             let bi  = blab.map(|l| l.icon()).unwrap_or("");
+            // Format move times compactly
+            let wt = app.gs.history.get(i).map(|h| fmt_move_time(h.move_time_ms)).unwrap_or_default();
+            let bt = app.gs.history.get(i+1).map(|h| fmt_move_time(h.move_time_ms)).unwrap_or_default();
             lines.push(Line::from(vec![
                 Span::styled(format!(" {:>3}. ", n), sty(DIMMER)),
                 Span::styled(format!("{:<8}", w), w_sty),
-                Span::styled(format!("{:<3} ", wi), sty(wlc)),
+                Span::styled(format!("{:<3}", wi), sty(wlc)),
+                Span::styled(format!("{:<4} ", wt), sty(DIMMER)),
                 Span::styled(format!("{:<8}", b), b_sty),
                 Span::styled(format!("{:<3}", bi), sty(blc)),
             ]));
@@ -585,7 +609,9 @@ fn draw_keybinds(app: &App, f: &mut Frame, area: Rect) {
         Line::from(vec![Span::styled(" any letter     type notation", sty(DIM))]),
         Line::from(vec![
             Span::styled(" E ", sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled("  export PNG  ", sty(DIM)),
+            Span::styled(" PNG  ", sty(DIM)),
+            Span::styled(" G ", sty(TEAL).add_modifier(Modifier::BOLD)),
+            Span::styled(" PGN  ", sty(DIM)),
             Span::styled(" T ", sty(AMBER).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" mode[{}]", mode_label), sty(DIM)),
         ]),
@@ -636,7 +662,10 @@ fn draw_gameover(app: &App, f: &mut Frame) {
 
     let save_line = if app.png_notice.is_some() {
         let path = app.png_export_path.as_deref().unwrap_or("");
-        (format!("  ✓ PNG: {}", path.split('/').last().unwrap_or(path)), GREEN)
+        (format!("  + PNG saved: {}", path.split('/').last().unwrap_or(path)), GREEN)
+    } else if app.pgn_notice.is_some() {
+        let path = app.pgn_saved_path.as_deref().unwrap_or("");
+        (format!("  + PGN saved: {}", path.split('/').last().unwrap_or(path)), TEAL)
     } else if let Some(p) = &app.pgn_saved_path {
         (format!("  PGN: {}", p.split('/').last().unwrap_or(p)), TEAL)
     } else {
@@ -665,6 +694,8 @@ fn draw_gameover(app: &App, f: &mut Frame) {
         Span::styled("r  replay", sty(TEAL).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled("E  PNG", sty(GREEN).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("G  PGN", sty(TEAL).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled("u  undo", sty(DIM)),
         Span::raw("  "),
@@ -1249,4 +1280,392 @@ fn center(w: u16, h: u16, a: Rect) -> Rect {
 }
 fn pad(r: Rect, px: u16, py: u16) -> Rect {
     Rect::new(r.x+px, r.y+py, r.width.saturating_sub(px*2), r.height.saturating_sub(py*2))
+}
+
+
+// ── PGN SAVED OVERLAY ─────────────────────────────────────────────────────────
+fn draw_pgn_saved(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let rect = center(62, 16, f.area());
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(TEAL)).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" G  PGN SAVED ", sty(TEAL).add_modifier(Modifier::BOLD))),
+        rect,
+    );
+    let inner = pad(rect, 2, 1);
+
+    let path_str = app.pgn_saved_path.as_deref().unwrap_or("?");
+    let home     = std::env::var("HOME").unwrap_or_default();
+    let display  = if path_str.starts_with(&home) {
+        format!("~{}", &path_str[home.len()..])
+    } else { path_str.to_string() };
+    let moves    = app.gs.history.len();
+    let result   = if app.replay_result.is_empty() { "Game in progress".to_string() }
+                   else { app.replay_result.clone() };
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Saved PGN game notation to:", sty(DIM)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("  {}", display), sty(TEAL).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("  {} moves  |  {}", moves, result), sty(DIM)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Any key ", sty(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled("  close", sty(DIM)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ── MOVE TIME FORMATTER ───────────────────────────────────────────────────────
+fn fmt_move_time(ms: u64) -> String {
+    if ms == 0   { return String::new(); }
+    if ms < 1000 { return format!("{}ms", ms); }
+    format!("{:.1}s", ms as f32 / 1000.0)
+}
+
+// ── FEN INPUT SCREEN ──────────────────────────────────────────────────────────
+fn draw_fen_input(app: &App, f: &mut Frame) {
+    use ratatui::widgets::Wrap;
+    let th   = app.cfg.theme;
+    let rect = center(70, 18, f.area());
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" \u{2261} START FROM FEN ", sty(ac(th)).add_modifier(Modifier::BOLD))),
+        rect,
+    );
+    let inner = pad(rect, 2, 1);
+
+    let cursor = if (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() / 500) % 2 == 0 { "\u{2588}" } else { "" };
+
+    let (input_col, hint) = if let Some(err) = &app.fen_input_err {
+        (RED,  format!("\u{2717}  {}", err))
+    } else {
+        (CREAM, "Paste or type a FEN string and press Enter".to_string())
+    };
+
+    let example = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(" FEN:", sty(DIM))]),
+        Line::from(vec![
+            Span::styled(
+                format!(" {}{}", app.fen_input_buf, cursor),
+                sty(input_col).add_modifier(Modifier::BOLD),
+            )
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!(" {}", hint), sty(if app.fen_input_err.is_some() { RED } else { DIM }))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  \u{2500}\u{2500}\u{2500} {:─<56}", ""), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(" Example:", sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!(" {}", example), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  \u{2500}\u{2500}\u{2500} {:─<56}", ""), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Enter ", sty(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(" load position    ", sty(DIM)),
+            Span::styled(" Esc ", sty(DIM)),
+            Span::styled(" cancel", sty(DIM)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ── PGN IMPORT SCREEN ─────────────────────────────────────────────────────────
+fn draw_pgn_import(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let rect = center(72, 22, f.area());
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" IMPORT PGN ", sty(ac(th)).add_modifier(Modifier::BOLD))),
+        rect,
+    );
+    let inner = pad(rect, 2, 1);
+
+    let blink = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() / 500) % 2 == 0;
+    let cursor = if blink { "\u{2588}" } else { " " };
+
+    let char_count = app.pgn_input_buf.len();
+    let mode_hint = if app.pgn_input_buf.starts_with('/') || app.pgn_input_buf.starts_with('~') {
+        " (file path mode)"
+    } else if app.pgn_input_buf.contains('[') {
+        " (PGN text mode \u{2713})"
+    } else if char_count > 0 {
+        " (detecting...)"
+    } else {
+        ""
+    };
+
+    // Show last 6 lines of what the user typed/pasted
+    let all_lines: Vec<&str> = app.pgn_input_buf.lines().collect();
+    let show_from = all_lines.len().saturating_sub(6);
+    let visible = &all_lines[show_from..];
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(" Paste PGN text  ", sty(DIM)),
+            Span::styled("or", sty(DIMMER)),
+            Span::styled("  type a file path", sty(DIM)),
+        ]),
+        Line::from(vec![Span::styled(format!("  {:=<64}", ""), sty(DIMMER))]),
+    ];
+
+    if visible.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {}", cursor), sty(TEAL))
+        ]));
+        for _ in 0..5 { lines.push(Line::from("")); }
+    } else {
+        let last_i = visible.len() - 1;
+        for (i, pline) in visible.iter().enumerate() {
+            let txt = if i == last_i {
+                format!(" {}{}", pline, cursor)
+            } else {
+                format!(" {}", pline)
+            };
+            lines.push(Line::from(vec![Span::styled(txt, sty(CREAM))]));
+        }
+        while lines.len() < 8 { lines.push(Line::from("")); }
+    }
+
+    lines.push(Line::from(vec![Span::styled(format!("  {:=<64}", ""), sty(DIMMER))]));
+
+    if let Some(err) = &app.pgn_input_err {
+        lines.push(Line::from(vec![Span::styled(format!(" x {}", err), sty(RED))]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} chars{}", char_count, mode_hint), sty(DIMMER)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled("  Examples:", sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled(
+        "  ~/rchess_export/game.pgn       <- file path", sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled(
+        "  [White \"Me\"] 1. e4 e5 2. ...  <- paste text", sty(DIMMER))]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Enter ", sty(GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled(" load    ", sty(DIM)),
+        Span::styled(" Backspace ", sty(DIM)),
+        Span::styled(" delete    ", sty(DIM)),
+        Span::styled(" Esc ", sty(DIM)),
+        Span::styled(" cancel", sty(DIM)),
+    ]));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+
+// ── PUZZLE SCREEN ─────────────────────────────────────────────────────────────
+fn draw_puzzle(app: &App, f: &mut Frame) {
+    let a  = f.area();
+    let th = app.cfg.theme;
+    f.render_widget(Block::default().style(Style::default().bg(bg0(th))), a);
+
+    use crate::puzzle::PuzzleState;
+
+    match &app.puzzle_state {
+        PuzzleState::Loading => {
+            let rect = center(40, 7, a);
+            f.render_widget(Clear, rect);
+            f.render_widget(
+                Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                    .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+                    .title(Span::styled(" \u{2605} DAILY PUZZLE ", sty(ac(th)).add_modifier(Modifier::BOLD))),
+                rect,
+            );
+            let inner = pad(rect, 2, 1);
+            f.render_widget(Paragraph::new(vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(" \u{23f3} Fetching from Lichess...", sty(TEAL))]),
+                Line::from(""),
+                Line::from(vec![Span::styled(" Esc to cancel", sty(DIMMER))]),
+            ]), inner);
+        }
+        PuzzleState::Failed(e) => {
+            let has_token = !app.cfg.lichess_token.is_empty();
+            let rect = center(66, 19, a);
+            f.render_widget(Clear, rect);
+            f.render_widget(
+                Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                    .border_style(sty(RED)).style(Style::default().bg(bg1(th)))
+                    .title(Span::styled(" ★ DAILY PUZZLE — FAILED ", sty(RED).add_modifier(Modifier::BOLD))),
+                rect,
+            );
+            let inner = pad(rect, 2, 1);
+            let sep = format!("  {:─<56}", "");
+            let mut lines: Vec<Line> = vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(format!(" Error: {}", e), sty(RED).add_modifier(Modifier::BOLD))]),
+                Line::from(""),
+                Line::from(vec![Span::styled(&sep, sty(DIMMER))]),
+                Line::from(""),
+            ];
+            if !has_token {
+                lines.push(Line::from(vec![Span::styled(" Lichess works without a token, but may rate-limit", sty(DIM))]));
+                lines.push(Line::from(vec![Span::styled(" anonymous requests. A free token fixes this:", sty(DIM))]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled("  1. Sign up free at lichess.org", sty(TEAL))]));
+                lines.push(Line::from(vec![Span::styled("  2. Go to lichess.org/account/security", sty(TEAL))]));
+                lines.push(Line::from(vec![Span::styled("  3. Create a Personal API Token (no scopes needed)", sty(TEAL))]));
+                lines.push(Line::from(vec![Span::styled("  4. Add to ~/.config/rchess/rchess_tui.conf:", sty(DIM))]));
+                lines.push(Line::from(vec![Span::styled("     lichess_token = lip_xxxxxxxxxxxx", sty(AMBER).add_modifier(Modifier::BOLD))]));
+            } else {
+                lines.push(Line::from(vec![Span::styled(" Token is configured. Check your internet.", sty(DIM))]));
+                lines.push(Line::from(vec![Span::styled(" Also try: sudo pacman -S ca-certificates", sty(DIMMER))]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(""));
+                lines.push(Line::from(""));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(&sep, sty(DIMMER))]));
+            lines.push(Line::from(vec![
+                Span::styled(" n ", sty(GREEN).add_modifier(Modifier::BOLD)),
+                Span::styled(" retry    ", sty(DIM)),
+                Span::styled(" Esc ", sty(DIM)),
+                Span::styled(" back to menu", sty(DIM)),
+            ]));
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+        state => {
+            // Puzzle is loaded — show board + info panel
+            let bw = (3 + 8 * CELL_W as u16 + 3 + 2).min(a.width);
+            let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(a);
+            let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Min(0)]).areas(body);
+
+            // Top bar
+            let puzzle = app.puzzle.as_ref();
+            let (rating, themes_str) = if let Some(p) = puzzle {
+                let t = p.themes.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                (format!("{}",p.rating), t)
+            } else { ("?".to_string(), String::new()) };
+
+            let status_msg = match state {
+                PuzzleState::WaitingInput  => " Find the best move!",
+                PuzzleState::CorrectMove   => " \u{2713} Correct! Keep going...",
+                PuzzleState::WrongMove(_)  => " \u{2717} Wrong move — try again",
+                PuzzleState::Solved        => " \u{2605} Puzzle solved!",
+                PuzzleState::Setup         => " Setting up...",
+                _ => "",
+            };
+            let status_col = match state {
+                PuzzleState::CorrectMove | PuzzleState::Solved => GREEN,
+                PuzzleState::WrongMove(_) => RED,
+                _ => TEAL,
+            };
+
+            f.render_widget(
+                Paragraph::new(format!(
+                    " \u{2605} DAILY PUZZLE  Rating: {}  Themes: {}  {}",
+                    rating, themes_str, status_msg
+                )).style(Style::default().fg(status_col).bg(bg1(th))),
+                top,
+            );
+
+            // Board (reuse draw_board logic for the puzzle position)
+            draw_board(app, f, board_col);
+
+            // Side panel
+            draw_puzzle_sidebar(app, f, side_col);
+        }
+    }
+}
+
+fn draw_puzzle_sidebar(app: &App, f: &mut Frame, area: Rect) {
+    use crate::puzzle::PuzzleState;
+    let th = app.cfg.theme;
+    let [info_area, input_area, keys_area] = Layout::vertical([
+        Constraint::Length(8), Constraint::Length(5), Constraint::Min(3),
+    ]).areas(area);
+
+    // Puzzle info
+    let puzzle = app.puzzle.as_ref();
+    let you_are = app.gs.turn.name();
+    let solved  = app.puzzle_state == PuzzleState::Solved;
+    let wrong   = matches!(&app.puzzle_state, PuzzleState::WrongMove(_));
+
+    let info_lines = if let Some(p) = puzzle {
+        let themes: String = p.themes.iter().take(4)
+            .cloned().collect::<Vec<_>>().join("\n  ");
+        vec![
+            Line::from(vec![
+                Span::styled(" Puzzle  ", sty(DIMMER)),
+                Span::styled(format!("#{}", p.id), sty(CREAM).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Rating  ", sty(DIMMER)),
+                Span::styled(format!("{}", p.rating), sty(AMBER).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled(" You are ", sty(DIMMER)),
+                Span::styled(you_are, sty(if app.gs.turn == crate::engine::Color::White { pw(th) } else { pb_c(th) }).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled(if solved { " \u{2605} SOLVED!" } else if wrong { " \u{2717} Wrong" } else { " Find best move" },
+                    sty(if solved { GREEN } else if wrong { RED } else { TEAL }).add_modifier(Modifier::BOLD))
+            ]),
+            Line::from(""),
+            Line::from(vec![Span::styled(" Themes:", sty(DIMMER))]),
+            Line::from(vec![Span::styled(format!("  {}", themes), sty(DIM))]),
+        ]
+    } else {
+        vec![Line::from("")]
+    };
+    f.render_widget(Paragraph::new(info_lines).block(panel_block("PUZZLE", th)), info_area);
+
+    // Input (same as game input)
+    let cur_bc   = app.to_board(app.cursor);
+    let cur_name = format!("{}{}", (b'a' + cur_bc.1 as u8) as char, 8 - cur_bc.0);
+    let (input_line, input_col) = if !app.input_buf.is_empty() {
+        (format!("  [{}]  {}\u{2588}", cur_name, app.input_buf), CREAM)
+    } else {
+        (format!("  [{}]  type move or click", cur_name), DIM)
+    };
+    let hint = if let Some(err) = &app.input_err {
+        (format!("  \u{2717}  {}", err), RED)
+    } else {
+        ("  e.g. Nf3  or  navigate + Enter".to_string(), DIMMER)
+    };
+    f.render_widget(Paragraph::new(vec![
+        Line::from(vec![Span::styled(input_line, sty(input_col).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(hint.0, sty(hint.1))]),
+    ]).block(panel_block("INPUT", th)), input_area);
+
+    // Keys
+    f.render_widget(Paragraph::new(vec![
+        Line::from(vec![Span::styled(" \u{2191}\u{2193}\u{2190}\u{2192}/hjkl  move cursor", sty(DIM))]),
+        Line::from(vec![Span::styled(" Enter/click  select & move", sty(DIM))]),
+        Line::from(vec![Span::styled(" n  new puzzle    q  menu", sty(DIM))]),
+    ]).block(panel_block("KEYS", th)), keys_area);
 }

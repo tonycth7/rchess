@@ -1,219 +1,238 @@
 <div align="center">
 
-# ♟ rChess
+# ♟ rchess
 
-A chess game that lives in your terminal. Pure Rust.
+A fully-featured chess game that runs entirely in your terminal.
 
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange?logo=rust)](https://rustup.rs)
+[![AUR](https://img.shields.io/badge/AUR-rchess-blue?logo=archlinux)](https://aur.archlinux.org/packages/rchess)
 [![License](https://img.shields.io/badge/license-MIT-green)](#)
 
 </div>
 
 ---
 
-## What it is
+## What it does
 
-rchess is a fully playable terminal chess game.
-
-Play against a friend, fight the built-in AI, get your moves analysed in real time, replay games, and export board snapshots as PNG — all without leaving the keyboard (mouse support included if you want it).
+rchess is a terminal chess game with a built-in AI, real-time move analysis, opening book, Lichess daily puzzles, PNG/PGN export, and full mouse support. No GUI needed.
 
 ---
 
-## Install
+## Installation
 
-### Quick install (Cargo)
-
-```bash
-cargo install --git https://github.com/tonycth7/rchess
-rchess
-````
-
-### Build from source
+### Arch Linux — AUR
 
 ```bash
-git clone https://github.com/tonycth7/rchess
+yay -S rchess
+# or
+paru -S rchess
+```
+
+### From source
+
+```bash
+git clone https://github.com/yourname/rchess
 cd rchess
 cargo build --release
 ./target/release/rchess
 ```
 
----
-
-## Full feature support
-
-If you want **everything working (analysis + PNG export):**
+### Optional dependencies
 
 ```bash
-sudo pacman -S stockfish       # stronger move analysis
-sudo pacman -S python-pillow   # PNG board export
+# PNG board export (Shift+E in-game)
+sudo pacman -S python-pillow
+
+# Stronger move analysis
+sudo pacman -S stockfish
+
+# Unicode chess symbols (♔♕♖) in PNG export
+sudo pacman -S ttf-freefont
+
+# HTTPS certificates for Lichess puzzle API
+sudo pacman -S ca-certificates
 ```
-
-### Optional
-
-```bash
-# if you don't have a Nerd Font
-sudo pacman -S ttf-freefont    # Unicode chess symbols (♔♕♖)
-```
-
----
-
-## AUR (coming soon)
-
-```bash
-# paru
-paru -S rchess
-
-# yay
-yay -S rchess
-```
-
-> Not published yet — PKGBUILD will be added soon.
 
 ---
 
-## Playing
+## Controls
 
-Navigate with arrow keys or `hjkl`.
+| Key | Action |
+|-----|--------|
+| `↑↓←→` / `hjkl` | Move cursor |
+| `Enter` / `Space` / click | Select & move |
+| Type a move | `e2e4` · `Nf3` · `O-O` · `O-O-O` |
+| `u` | Undo |
+| `T` | Cycle UI mode (Minimal / Standard / Analysis) |
+| `E` (Shift) | Export board as PNG |
+| `G` (Shift) | Save game as PGN |
+| `r` | Replay game |
+| `d` | Offer draw (PvP) |
+| `n` | New game |
+| `s` | Settings |
+| `q` | Menu |
 
-* Select a piece → select destination
-* Or type moves directly: `e2e4`, `Nf3`, `O-O`
-* Input bar appears automatically when typing
+### Replay controls
 
-| Key             | What it does                  |
-| --------------- | ----------------------------- |
-| `hjkl` / arrows | Move cursor                   |
-| `Enter` / click | Select & move                 |
-| Type a move     | `e2e4`, `Nf3`, `O-O`, `O-O-O` |
-| `u`             | Undo                          |
-| `r`             | Replay the game               |
-| `E` (Shift)     | Export board as PNG           |
-| `T` (Shift)     | Cycle analysis panel          |
-| `d`             | Offer draw (PvP only)         |
-| `s`             | Settings                      |
-| `q`             | Main menu                     |
+| Key | Action |
+|-----|--------|
+| `←/h` · `→/l` | Step back / forward |
+| `0` / `$` | Jump to start / end |
+| `E` | Export current position as PNG |
 
 ---
 
 ## Move analysis
 
-After every move, a background engine labels what just happened:
+Every move is evaluated in the background and labelled:
 
-|      | Label      | Meaning            |
-| ---- | ---------- | ------------------ |
-| `B`  | Book       | Known opening line |
-| `+`  | Good       | Sound move         |
-| `?!` | Inaccuracy | Small slip         |
-| `?`  | Mistake    | Significant error  |
-| `??` | Blunder    | Serious mistake    |
+| Icon | Label | What it means |
+|------|-------|---------------|
+| `B` | Book | Known opening line |
+| `+` | Good | Sound move |
+| `?!` | Inaccuracy | Small slip (−0.5 to −1.0p) |
+| `?` | Mistake | Significant error (−1.0 to −3.0p) |
+| `??` | Blunder | Serious mistake (worse than −3.0p) |
 
-* Updates appear **live** in the history panel
-* UI never freezes during analysis
-
-Press `T` to switch modes:
-
-* **Minimal** — no engine info
-* **Standard** — compact labels
-* **Analysis** — full engine panel (top moves, eval change, replay graph)
-
----
+Labels appear live in the history panel without pausing the game. Switch to **Analysis mode** (`T`) to see the top 3 candidate moves, eval before/after, and an eval sparkline in Replay.
 
 ### Engine options
 
-The built-in engine works out of the box. Stockfish is optional but much stronger.
-
-| Engine           | Typical speed   | How to use                   |
-| ---------------- | --------------- | ---------------------------- |
-| Built-in depth 1 | ~1ms            | Default                      |
-| Built-in depth 2 | ~5–50ms         | Settings → Analysis depth    |
-| Built-in depth 3 | ~50–500ms       | Settings → Analysis depth    |
-| Stockfish        | ~300ms/position | Install + enable in settings |
-
----
-
-## Config
-
-Press `s` → Settings → `w` to save
-Or edit manually:
-
-```ini
-# ~/.config/rchess/rchess_tui.conf
-
-theme           = classic      # classic tournament mocha slate midnight crimson
-ai_depth        = 3            # 1 2 3 4
-time_control    = infinite     # infinite bullet blitz rapid classical
-ui_mode         = standard     # minimal standard analysis
-analysis_engine = builtin      # builtin stockfish
-analysis_depth  = 2            # 1=fast  2=balanced  3=strong
-auto_save_png   = false        # auto-save PNG on game end
-```
+| Engine | Speed | How to enable |
+|--------|-------|---------------|
+| Built-in d1 | ~1ms | Default |
+| Built-in d2 | ~5–50ms | Settings → Analysis depth |
+| Built-in d3 | ~50–500ms | Settings → Analysis depth |
+| Stockfish | 300ms/pos | `sudo pacman -S stockfish`, Settings → Analysis engine |
 
 ---
 
 ## PNG export
 
-Press `Shift+E` during a game → preview → `Y`
+`Shift+E` → preview → `Y` to confirm. Saved to `~/rchess_export/`.
 
-Saved to:
+Fonts are auto-detected using `fc-list` — your Nerd Font will work automatically if it has chess glyphs. Otherwise:
 
+```bash
+sudo pacman -S ttf-freefont
 ```
-~/rchess_export/
+
+---
+
+## Lichess daily puzzle
+
+From the main menu → **Daily Puzzle**. The puzzle board has full mouse support — click to select and move pieces.
+
+The API works anonymously, but a free token removes rate limits and is strongly recommended.
+
+### Getting a Lichess API token
+
+1. Create a free account at [lichess.org](https://lichess.org)
+2. Go to **lichess.org/account/security** → scroll down to **Personal API tokens**
+3. Click **Generate a personal API token**
+4. Give it any name (e.g. `rchess`)
+5. **Leave every permission checkbox unchecked** — the puzzle endpoint is public
+6. Click **Submit** and copy the token (starts with `lip_`)
+
+### Adding the token to rchess
+
+Edit (or create) `~/.config/rchess/rchess_tui.conf`:
+
+```ini
+lichess_token = lip_xxxxxxxxxxxxxxxxxxxx
 ```
 
-* Detects fonts via `fc-list`
-* Uses Nerd Font if available
-* Falls back to geometric pieces if not
+You can also set it via `s` → Settings → the token status is shown there. After adding the token, restart rchess and try the puzzle again.
+
+---
+
+## Config file
+
+**Location:** `~/.config/rchess/rchess_tui.conf`
+
+Created automatically when you press `w` in Settings. All options:
+
+```ini
+theme            = classic       # classic tournament mocha slate midnight crimson
+piece_style      = unicode       # unicode letters fatletters
+ai_depth         = 3             # 1=Easy  2=Medium  3=Hard  4=Expert
+move_hints       = dots          # dots highlight none
+time_control     = infinite      # infinite bullet blitz rapid classical
+show_coords      = true
+show_clock       = true
+flip_board       = false
+auto_flip        = false         # auto-flip board each turn in PvP
+confirm_move     = false
+ui_mode          = standard      # minimal standard analysis
+analysis_engine  = builtin       # builtin stockfish
+analysis_depth   = 2             # 1=fast  2=balanced  3=strong
+blunder_cp       = 300           # centipawns threshold for Blunder label
+mistake_cp       = 100           # centipawns threshold for Mistake label
+inaccuracy_cp    = 50            # centipawns threshold for Inaccuracy label
+stockfish_skill  = 10            # Stockfish skill level 0-20
+auto_save_png    = false         # auto-save PNG when game ends
+lichess_token    = lip_xxx       # your Lichess API token (optional)
+```
 
 ---
 
 ## Opening book
 
-Built-in opening book (~15 moves):
+The CPU uses a built-in opening book for the first ~15 moves. The current opening name is shown in the top bar (`[Sicilian — Najdorf]`).
 
-* Ruy López, Sicilian, French, Caro-Kann
-* Queen’s Gambit, King’s Indian, Nimzo-Indian
-* London, Réti, English
-
-Live display:
-
-```
-[Sicilian — Najdorf]
-```
+Covered: Ruy López, Italian, Scotch, Sicilian (Najdorf, Dragon, Kan), French, Caro-Kann, Queen's Gambit, King's Indian, Nimzo-Indian, London, Réti, English, and more.
 
 ---
 
-## Files saved automatically
+## Exports
 
-```
-~/rchess_export/
-├── *.pgn   # saved games
-└── *.png   # board snapshots
-```
+Both saved to `~/rchess_export/`:
 
-* PGN → saved on game end
-* PNG → manual or auto (`auto_save_png = true`)
-
----
-
-## Debugging
-
-Logs are written to:
-
-```bash
-tail -f /tmp/rchess.log
-```
-
-Never pollutes the terminal UI.
+| File | Trigger |
+|------|---------|
+| `rchess_board_<timestamp>.png` | `Shift+E` in-game or replay, or auto on game end |
+| `rchess_<movenum>.pgn` | `Shift+G` in-game, or auto on game end |
 
 ---
 
 ## Requirements
 
-|                 | Version   | Notes                                  |
-| --------------- | --------- | -------------------------------------- |
-| Rust + Cargo    | 1.70+     | [https://rustup.rs](https://rustup.rs) |
-| Terminal        | 115 × 32+ | Smaller works in Minimal mode          |
-| Stockfish       | optional  | Strong analysis                        |
-| Python + Pillow | optional  | PNG export                             |
+| | Version | Notes |
+|-|---------|-------|
+| Rust + Cargo | 1.70+ | [rustup.rs](https://rustup.rs) — build dependency only |
+| Terminal | 115×32+ recommended | Smaller works in Minimal mode |
+| Python + Pillow | any | PNG export only |
+| Stockfish | any | Analysis only |
+
+---
+
+## Project structure
+
+```
+src/
+├── main.rs        — event loop
+├── log.rs         — silent file logger (/tmp/rchess.log)
+├── engine.rs      — chess rules, move generation
+├── ai.rs          — minimax + alpha-beta + piece-square tables
+├── book.rs        — opening book + ECO name detection
+├── analysis.rs    — background analysis (built-in + Stockfish UCI, MultiPV)
+├── app.rs         — game state, key/mouse handlers
+├── ui.rs          — ratatui rendering (board, panels, overlays)
+├── config.rs      — settings, themes, enums
+├── png_export.rs  — board → PNG via Python Pillow
+├── puzzle.rs      — Lichess daily puzzle API + FEN parser
+└── pgn_import.rs  — PGN file/text parser
+```
+
+---
+
+## Debug log
+
+All internal output goes to `/tmp/rchess.log` — the terminal stays clean.
+
+```bash
+tail -f /tmp/rchess.log
+```
 
 ---
 
@@ -221,15 +240,8 @@ Never pollutes the terminal UI.
 
 <div align="center">
 
-*Classic theme — mid-game with analysis panel*
+![rchess gameplay](assets/rchess_board1.png)
 
-![rchess in-game screenshot](assets/rchess_board1.png)
-
-*Exported PNG — board position after 12 moves*
-
-![rchess exported PNG](assets/rchess_board2.png)
+![rchess PNG export](assets/rchess_board2.png)
 
 </div>
-```
-
----

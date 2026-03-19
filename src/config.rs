@@ -235,7 +235,7 @@ impl AnalysisEngine {
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub theme:           Theme,
     pub piece_style:     PieceStyle,
@@ -250,6 +250,16 @@ pub struct Config {
     pub ui_mode:         UiMode,
     /// Auto-save board PNG when a game ends (default: false)
     pub auto_save_png:   bool,
+    /// Optional Lichess API token for puzzle access (leave empty for anonymous)
+    pub lichess_token:   String,
+    /// Centipawn threshold for Blunder classification (default 300 = 3.0p)
+    pub blunder_cp:      i32,
+    /// Centipawn threshold for Mistake classification (default 100 = 1.0p)
+    pub mistake_cp:      i32,
+    /// Centipawn threshold for Inaccuracy classification (default 50 = 0.5p)
+    pub inaccuracy_cp:   i32,
+    /// Stockfish skill level 0-20 when used as CPU opponent (default 10)
+    pub stockfish_skill: u8,
     pub analysis_engine: AnalysisEngine,
     /// Depth for built-in analysis engine (1=fast, 2=balanced, 3=strong)
     pub analysis_depth: u8,
@@ -270,6 +280,11 @@ impl Default for Config {
             confirm_move:    false,
             ui_mode:         UiMode::Standard,
             auto_save_png:   false,
+            lichess_token:   String::new(),
+            blunder_cp:      300,
+            mistake_cp:      100,
+            inaccuracy_cp:    50,
+            stockfish_skill:  10,
             analysis_engine: AnalysisEngine::Builtin,
             analysis_depth: 2,
         }
@@ -325,6 +340,11 @@ impl Config {
                             _          => UiMode::Standard,
                         },
                         "auto_save_png"   => cfg.auto_save_png   = val == "true",
+                        "lichess_token"   => cfg.lichess_token   = val.to_string(),
+                        "blunder_cp"      => cfg.blunder_cp      = val.parse().unwrap_or(300),
+                        "mistake_cp"      => cfg.mistake_cp      = val.parse().unwrap_or(100),
+                        "inaccuracy_cp"   => cfg.inaccuracy_cp   = val.parse().unwrap_or(50),
+                        "stockfish_skill" => cfg.stockfish_skill = val.parse().unwrap_or(10),
                         "analysis_engine" => cfg.analysis_engine = match val {
                             "stockfish" => AnalysisEngine::Stockfish,
                             _           => AnalysisEngine::Builtin,
@@ -363,6 +383,11 @@ impl Config {
                  confirm_move     = {}\n\
                  ui_mode          = {}\n\
                  auto_save_png    = {}\n\
+                 lichess_token    = {}\n\
+                 blunder_cp       = {}\n\
+                 mistake_cp       = {}\n\
+                 inaccuracy_cp    = {}\n\
+                 stockfish_skill  = {}\n\
                  analysis_engine  = {}\n\
                  analysis_depth   = {}\n",
                 match self.theme {
@@ -391,6 +416,9 @@ impl Config {
                     UiMode::Analysis=>"analysis",
                 },
                 self.auto_save_png,
+                self.lichess_token,
+                self.blunder_cp, self.mistake_cp, self.inaccuracy_cp,
+                self.stockfish_skill,
                 match self.analysis_engine {
                     AnalysisEngine::Builtin=>"builtin",
                     AnalysisEngine::Stockfish=>"stockfish",

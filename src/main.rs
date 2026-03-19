@@ -4,6 +4,8 @@
 #[macro_use]
 mod log;
 mod engine;
+mod puzzle;
+mod pgn_import;
 mod ai;
 mod book;
 mod app;
@@ -31,7 +33,9 @@ fn main() -> io::Result<()> {
     for arg in &args[1..] {
         match arg.as_str() {
             "-v" | "--version" | "-V" => {
-                println!("rChess-tui v{}", VERSION);
+                println!("RChess-tui v{}", VERSION);
+                println!("Features: PNG export, opening book, PGN, replay, draw offers, mouse");
+                println!("Built with ratatui 0.27 + crossterm 0.27");
                 return Ok(());
             }
             "-h" | "--help" => {
@@ -94,6 +98,10 @@ fn main() -> io::Result<()> {
                         Screen::DrawOffer   => app.handle_draw_offer_key(key.code),
                         Screen::Replay      => app.handle_replay_key(key.code),
                         Screen::PngPreview  => app.handle_png_preview_key(key.code),
+                        Screen::FenInput    => app.handle_fen_input_key(key.code),
+                        Screen::PgnImport   => app.handle_pgn_import_key(key.code),
+                        Screen::Puzzle      => app.handle_puzzle_key(key.code),
+                        Screen::PgnSaved    => { app.screen = Screen::Game; }  // any key closes
                     }
                 }
                 // ── Mouse ─────────────────────────────────────────────────────
@@ -108,6 +116,7 @@ fn main() -> io::Result<()> {
 
         if last_tick.elapsed() >= tick {
             app.poll_ai();
+            app.poll_puzzle();
             last_tick = Instant::now();
         }
 
