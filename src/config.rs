@@ -81,6 +81,17 @@ impl Theme {
             _              => ((240,235,210),(28,18, 8)),
         }
     }
+    /// (bg_root, bg_panel) — background tones that match the theme
+    pub fn bg_colors(self) -> ((u8,u8,u8),(u8,u8,u8)) {
+        match self {
+            Theme::Classic    => ((36, 22, 12), (52, 34, 18)),
+            Theme::Tournament => ((14, 20, 14), (22, 30, 22)),
+            Theme::Mocha      => ((30, 18,  8), (44, 28, 14)),
+            Theme::Slate      => ((16, 20, 28), (22, 28, 40)),
+            Theme::Midnight   => (( 8,  8, 20), (14, 14, 32)),
+            Theme::Crimson    => ((28,  8,  8), (42, 14, 14)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
