@@ -1,9 +1,9 @@
 [package]
 name        = "rchess"
-version     = "0.7.0"
+version     = "0.7.3"
 edition     = "2021"
 authors     = ["RChess TUI"]
-description = "Terminal chess — v0.7 with PNG export, opening book, PGN, replay, analysis, mouse"
+description = "Terminal chess — v0.8 with puzzles, PGN import, FEN import, analysis, mouse"
 
 [[bin]]
 name = "rchess"
@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 ratatui   = "0.29"
 crossterm = "0.28"
+ureq      = { version = "2", features = ["json"] }
 
-# Suppress false-positive dead_code warnings on pub fields used only in ui.rs
 [lints.rust]
 dead_code = "warn"
