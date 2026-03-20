@@ -30,8 +30,10 @@ const TEAL:   Color = Color::Rgb(80, 180,140);
 const AMBER:  Color = Color::Rgb(220,160, 40);
 const GREEN:  Color = Color::Rgb(120,220,160);
 
-const CELL_W: usize = 9;
-const CELL_H: usize = 5;
+// CELL_W and CELL_H are now read from app.cfg.cell_w / app.cfg.cell_h
+// Defaults kept here as fallback for non-game screens
+const DEFAULT_CELL_W: usize = 8;
+const DEFAULT_CELL_H: usize = 4;
 
 // Safely truncate to max visible chars
 fn trunc(s: &str, max: usize) -> String {
@@ -143,7 +145,13 @@ fn draw_color_pick(app: &App, f: &mut Frame) {
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
 fn draw_settings(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
-    let rect = center(68, 38, f.area());
+    let area = f.area();
+
+    // Use most of the terminal — leaves 2 rows top/bottom for breathing room
+    let h    = area.height.saturating_sub(4).max(10);
+    let w    = 72u16.min(area.width.saturating_sub(4));
+    let rect = center(w, h, area);
+
     f.render_widget(
         Block::default().borders(Borders::ALL).border_type(BorderType::Double)
             .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
@@ -151,55 +159,159 @@ fn draw_settings(app: &App, f: &mut Frame) {
         rect,
     );
     let inner = pad(rect, 2, 1);
-    let rows: &[(&str,&str)] = &[
-        ("Theme",           app.cfg.theme.name()),
-        ("Piece style",     app.cfg.piece_style.name()),
-        ("AI difficulty",   app.cfg.ai_depth.name()),
-        ("Move hints",      app.cfg.move_hints.name()),
-        ("Time control",    app.cfg.time_control.name()),
-        ("Show coords",     if app.cfg.show_coords {"ON"} else {"OFF"}),
-        ("Show clock",      if app.cfg.show_clock  {"ON"} else {"OFF"}),
-        ("Flip board",      if app.cfg.flip_board  {"ON"} else {"OFF"}),
-        ("Auto-flip PvP",   if app.cfg.auto_flip   {"ON"} else {"OFF"}),
-        ("Confirm move",    if app.cfg.confirm_move{"ON"} else {"OFF"}),
-        ("UI mode",         app.cfg.ui_mode.name()),
-        ("Analysis engine", app.cfg.analysis_engine.name()),
-        ("Analysis depth",  match app.cfg.analysis_depth { 1=>"1  (fast)", 2=>"2  (balanced)", 3=>"3  (strong)", _=>"2" }),
-        ("Auto-save PNG",   if app.cfg.auto_save_png  {"ON  (saves on game end)"} else {"OFF (manual only)"}),
-        ("Lichess token",   if app.cfg.lichess_token.is_empty() {"(none — anonymous)"} else {"(set — see config file)"}),
+
+    // All settings rows
+    let highlight_str = match app.cfg.highlight_brightness {
+        0 => "0  (dim)", 5 => "5  (default)", 10 => "10 (vivid)",
+        n => Box::leak(format!("{}", n).into_boxed_str()),
+    };
+    let rows: &[(&str, &str)] = &[
+        ("Theme",            app.cfg.theme.name()),
+        ("Piece style",      app.cfg.piece_style.name()),
+        ("AI difficulty",    app.cfg.ai_depth.name()),
+        ("Move hints",       app.cfg.move_hints.name()),
+        ("Time control",     app.cfg.time_control.name()),
+        ("Show coords",      if app.cfg.show_coords {"ON"} else {"OFF"}),
+        ("Show clock",       if app.cfg.show_clock  {"ON"} else {"OFF"}),
+        ("Flip board",       if app.cfg.flip_board  {"ON"} else {"OFF"}),
+        ("Auto-flip PvP",    if app.cfg.auto_flip   {"ON"} else {"OFF"}),
+        ("Confirm move",     if app.cfg.confirm_move{"ON"} else {"OFF"}),
+        ("UI mode",          app.cfg.ui_mode.name()),
+        ("Analysis engine",  app.cfg.analysis_engine.name()),
+        ("Analysis depth",   match app.cfg.analysis_depth { 1=>"1  (fast)", 2=>"2  (balanced)", _=>"3  (strong)" }),
+        ("Auto-save PNG",    if app.cfg.auto_save_png  {"ON"} else {"OFF"}),
+        ("Highlight bright", highlight_str),
+        ("Board cell width",  match app.cfg.cell_w { 4=>"4 (tiny)", 6=>"6 (small)", 8=>"8 (default)", 10=>"10 (large)", 12=>"12 (huge)", n => Box::leak(format!("{}", n).into_boxed_str()) }),
+        ("Board cell height", match app.cfg.cell_h { 2=>"2 (flat)", 3=>"3", 4=>"4 (default)", 5=>"5", 6=>"6 (tall)", n => Box::leak(format!("{}", n).into_boxed_str()) }),
+        ("Lichess token",    if app.cfg.lichess_token.is_empty() {"(not set)"} else {"(configured ✓)"}),
     ];
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<60}",""), sty(DIMMER))]),
+    let n = rows.len();
+
+    // How many rows fit in the visible area (each row = 2 lines: label + blank)
+    // inner height - 4 (header sep + footer sep + 2 lines footer) = visible budget
+    let budget = inner.height.saturating_sub(5) as usize;
+    let visible = (budget / 2).max(1);
+
+    // Scroll to keep selected row visible
+    let cur = app.settings_cur;
+    // scroll_off: first row index to show
+    let scroll = if cur < visible { 0 }
+                 else { cur + 1 - visible };
+    let scroll = scroll.min(n.saturating_sub(visible));
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(DIMMER))]),
         Line::from(""),
     ];
-    for (i,(label,value)) in rows.iter().enumerate() {
-        let s = app.settings_cur == i;
+
+    // Scroll indicator top
+    if scroll > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  ▲ {} more above", scroll), sty(DIMMER))]));
+    } else {
+        lines.push(Line::from(""));
+    }
+
+    // Visible rows
+    for i in scroll..(scroll + visible).min(n) {
+        let (label, value) = rows[i];
+        let s = cur == i;
         lines.push(Line::from(vec![
-            Span::styled(if s{" ▶ "}else{"   "}, sty(ac(th))),
-            Span::styled(format!("{:<18}",label), if s{sty(ac(th)).add_modifier(Modifier::BOLD)}else{sty(CREAM)}),
+            Span::styled(if s { " ▶ " } else { "   " }, sty(ac(th))),
+            Span::styled(
+                format!("{:<18}", label),
+                if s { sty(ac(th)).add_modifier(Modifier::BOLD) } else { sty(CREAM) },
+            ),
             Span::raw("  "),
             Span::styled(
-                if s{format!("◀  {}  ▶",value)}else{format!("   {}   ",value)},
-                if s{Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)}else{sty(DIM)}),
+                if s { format!("◀  {}  ▶", value) } else { format!("   {}   ", value) },
+                if s { Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD) } else { sty(DIM) },
+            ),
         ]));
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(vec![Span::styled(format!("  {:─<60}",""), sty(DIMMER))]));
-    lines.push(Line::from(""));
-    let (hint,hcol) = if app.saved_notice.is_some() {
-        ("  ✓ Saved to ~/.config/rchess/rchess_tui.conf", GREEN)
+
+    // Scroll indicator bottom
+    let below = n.saturating_sub(scroll + visible);
+    if below > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  ▼ {} more below  (↓ to scroll)", below), sty(DIMMER))]));
     } else {
-        ("  w save    r reset    ←→ change value    Esc back", DIMMER)
-    };
-    lines.push(Line::from(vec![Span::styled(hint, sty(hcol))]));
+        lines.push(Line::from(""));
+    }
+
+    // Footer separator
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(DIMMER))]));
+
+    // Save notice or hint
+    if app.saved_notice.is_some() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = format!("{}/.config/rchess/rchess_tui.conf", home);
+        lines.push(Line::from(vec![
+            Span::styled("  ✓ Saved  ", sty(GREEN).add_modifier(Modifier::BOLD)),
+            Span::styled(path, sty(GREEN)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "  w/s save  r reset  ←→/hl change  jk navigate  Esc back",
+            sty(DIMMER),
+        )]));
+    }
+
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+
+// ── BLOCK ART PIECES ──────────────────────────────────────────────────────────
+// Each piece is defined as 5 rows × 9 chars using block characters.
+// ' ' = square bg shows through, '█' = piece colour.
+// Pieces are designed to be visually distinct at a glance.
+fn piece_block_row(k: Kind, line: usize) -> &'static str {
+    match (k, line) {
+        // ── Pawn: round head, tapered body, wide base ─────────────────────────
+        (Kind::P, 0) => "         ",
+        (Kind::P, 1) => "   ███   ",
+        (Kind::P, 2) => "   ███   ",
+        (Kind::P, 3) => "  █████  ",
+        (Kind::P, _) => "         ",
+        // ── Knight: L-shaped head charging left ───────────────────────────────
+        (Kind::N, 0) => "   ████  ",
+        (Kind::N, 1) => "  █████  ",
+        (Kind::N, 2) => "  ████   ",
+        (Kind::N, 3) => "  █████  ",
+        (Kind::N, _) => "         ",
+        // ── Bishop: tall diamond/mitre shape ──────────────────────────────────
+        (Kind::B, 0) => "    █    ",
+        (Kind::B, 1) => "   ███   ",
+        (Kind::B, 2) => "  █████  ",
+        (Kind::B, 3) => " ███████ ",
+        (Kind::B, _) => "         ",
+        // ── Rook: battlements on top ───────────────────────────────────────────
+        (Kind::R, 0) => " █ █ █ █ ",
+        (Kind::R, 1) => " ███████ ",
+        (Kind::R, 2) => "  █████  ",
+        (Kind::R, 3) => " ███████ ",
+        (Kind::R, _) => "         ",
+        // ── Queen: wide crown with 5 points ───────────────────────────────────
+        (Kind::Q, 0) => " █ █ █ █ ",
+        (Kind::Q, 1) => " ███████ ",
+        (Kind::Q, 2) => " ███████ ",
+        (Kind::Q, 3) => " ███████ ",
+        (Kind::Q, _) => "         ",
+        // ── King: cross on top, solid body ────────────────────────────────────
+        (Kind::K, 0) => "    █    ",
+        (Kind::K, 1) => "  █████  ",
+        (Kind::K, 2) => "  █████  ",
+        (Kind::K, 3) => " ███████ ",
+        (Kind::K, _) => "         ",
+    }
 }
 
 // ── GAME ──────────────────────────────────────────────────────────────────────
 fn draw_game(app: &App, f: &mut Frame) {
     let a  = f.area();
-    let bw = (3 + 8*CELL_W as u16 + 3 + 2).min(a.width);
+    let cell_w = app.cfg.cell_w as u16;
+    let bw = (3 + 8*cell_w + 3 + 2).min(a.width);
     let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(a);
     let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Min(0)]).areas(body);
     let [board_area, input_area] = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).areas(board_col);
@@ -253,6 +365,10 @@ fn draw_topbar(app: &App, f: &mut Frame, area: Rect) {
 
 // ── BOARD ─────────────────────────────────────────────────────────────────────
 fn draw_board(app: &App, f: &mut Frame, area: Rect) {
+    #[allow(non_snake_case)]
+    let CELL_W = app.cfg.cell_w as usize;
+    #[allow(non_snake_case)]
+    let CELL_H = app.cfg.cell_h as usize;
     let th      = app.cfg.theme;
     let flipped = app.flipped();
     let row_ord: Vec<usize> = if flipped { (0..8).rev().collect() } else { (0..8).collect() };
@@ -276,9 +392,31 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect) {
             ((sq.2 as u16*2+lm.2 as u16)/3) as u8,
         )
     };
+    // highlight_brightness: 0=square barely changes, 10=vivid neon
+    // Works by blending between the natural square color and a vivid target color
+    let brightness = app.cfg.highlight_brightness;
+    let blend_color = |base: Color, target: (u8,u8,u8)| -> Color {
+        if let Color::Rgb(br, bg, bb) = base {
+            let t = brightness as u16; // 0..10
+            let r = ((br as u16 * (10-t) + target.0 as u16 * t) / 10) as u8;
+            let g = ((bg as u16 * (10-t) + target.1 as u16 * t) / 10) as u8;
+            let b = ((bb as u16 * (10-t) + target.2 as u16 * t) / 10) as u8;
+            Color::Rgb(r, g, b)
+        } else { base }
+    };
+    // Hint dot fg: starts near white at 0 (barely visible on square), vivid green at 10
+    let hint_fg = blend_color(
+        if (0usize+0usize)%2==0 { sq_l(th) } else { sq_d(th) }, // approx avg
+        (0, 255, 140)  // vivid neon green target
+    );
+    // Dot tint: blend square bg toward gold
+    let dot_tint = |is_light: bool| {
+        blend_color(if is_light { sq_l(th) } else { sq_d(th) }, (220, 200, 40))
+    };
+    // Full highlight square: blend toward bright teal
     let hl_color = |is_light: bool| {
-        // Bright highlight: vivid green-teal on dark squares, neon-yellow on light squares
-        if is_light { Color::Rgb(200, 230, 0) } else { Color::Rgb(0, 210, 140) }
+        blend_color(if is_light { sq_l(th) } else { sq_d(th) },
+            if is_light { (180, 230, 50) } else { (20, 200, 130) })
     };
 
     let mut lines: Vec<Line> = vec![];
@@ -310,27 +448,43 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect) {
                     else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Highlight) { hl_color(is_light) }
                 // Dots mode: tint the square background slightly so dot stands out
                 else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) && piece.is_none() {
-                    if is_light { Color::Rgb(180, 200, 80) } else { Color::Rgb(30, 100, 80) }
+                    dot_tint(is_light)
                 }
                     else if is_last      { lm_color(is_light) }
                     else if is_light     { sq_l(th) }
                     else                 { sq_d(th) };
 
-                let cell_str = if is_mid {
-                    if let Some(p) = piece { center_str(&piece_sym(p,&app.cfg.piece_style), CELL_W) }
-                    else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) { center_str("⬤", CELL_W) }  // U+2B24 large filled circle
-                    else { " ".repeat(CELL_W) }
-                } else if line_idx==CELL_H-1 && is_tgt && piece.is_some() {
-                    format!("  {:─<width$}  ","",width=CELL_W.saturating_sub(4))
-                } else { " ".repeat(CELL_W) };
+                let is_blocks = matches!(app.cfg.piece_style, PieceStyle::Blocks);
 
-                let mut style = Style::default().bg(bg);
-                if let Some(p) = piece {
-                    style = style.fg(if p.c==PC::White{pw(th)}else{pb_c(th)}).add_modifier(Modifier::BOLD);
-                } else if is_tgt && matches!(app.cfg.move_hints, MoveHints::Dots) {
-                    // Bright contrasting dot color that pops on any square
-                    style = style.fg(Color::Rgb(0, 255, 160)).add_modifier(Modifier::BOLD);
-                } else if is_tgt { style = style.fg(Color::Rgb(0, 255, 160)).add_modifier(Modifier::BOLD); }
+                let (cell_str, mut style) = if is_blocks {
+                    // Block art: every row of the cell renders a slice of the piece shape
+                    let (row_str, fg) = if let Some(p) = piece {
+                        let row = piece_block_row(p.k, line_idx);
+                        let fg  = if p.c == PC::White { pw(th) } else { pb_c(th) };
+                        (row.to_string(), fg)
+                    } else if is_tgt && matches!(app.cfg.move_hints, MoveHints::Dots) && line_idx == CELL_H/2 {
+                        (center_str("⬤", CELL_W), hint_fg)
+                    } else {
+                        (" ".repeat(CELL_W), bg)
+                    };
+                    (row_str, Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD))
+                } else {
+                    // Classic: piece symbol on middle line only
+                    let s = if is_mid {
+                        if let Some(p) = piece { center_str(&piece_sym(p,&app.cfg.piece_style), CELL_W) }
+                        else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) { center_str("⬤", CELL_W) }
+                        else { " ".repeat(CELL_W) }
+                    } else if line_idx==CELL_H-1 && is_tgt && piece.is_some() {
+                        format!("  {:─<width$}  ","",width=CELL_W.saturating_sub(4))
+                    } else { " ".repeat(CELL_W) };
+                    let mut st = Style::default().bg(bg);
+                    if let Some(p) = piece {
+                        st = st.fg(if p.c==PC::White{pw(th)}else{pb_c(th)}).add_modifier(Modifier::BOLD);
+                    } else if is_tgt {
+                        st = st.fg(hint_fg).add_modifier(Modifier::BOLD);
+                    }
+                    (s, st)
+                };
                 spans.push(Span::styled(cell_str, style));
             }
             if app.cfg.show_coords {
@@ -836,9 +990,10 @@ fn draw_draw_offer(app: &App, f: &mut Frame) {
 fn draw_replay(app: &App, f: &mut Frame) {
     let th = app.cfg.theme;
     let a  = f.area();
+    let cell_w = app.cfg.cell_w as u16;
     f.render_widget(Block::default().style(Style::default().bg(bg0(th))), a);
 
-    let bw = (3 + 8*CELL_W as u16 + 3 + 2).min(a.width);
+    let bw = (3 + 8*cell_w + 3 + 2).min(a.width);
     let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(a);
     let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Min(0)]).areas(body);
 
@@ -847,11 +1002,26 @@ fn draw_replay(app: &App, f: &mut Frame) {
         app.replay_idx, app.replay_snaps.len().saturating_sub(1), app.replay_result);
     f.render_widget(Paragraph::new(title).style(Style::default().fg(TEAL).bg(bg1(th))), top);
 
-    if let Some(snap) = snap { draw_replay_board(app, f, board_col, snap); }
+    // Split board column: narrow eval bar on left, board on right
+    let [eval_bar_col, actual_board_col] = Layout::horizontal([
+        Constraint::Length(4),
+        Constraint::Min(0),
+    ]).areas(board_col);
+
+    if let Some(snap) = snap { draw_replay_board(app, f, actual_board_col, snap); }
+
+    // Draw vertical eval bar
+    let cur_eval = app.eval_history.get(app.replay_idx).copied().unwrap_or(0);
+    draw_eval_bar(cur_eval, app.engine_busy, f, eval_bar_col);
+
     draw_replay_sidebar(app, f, side_col);
 }
 
 fn draw_replay_board(app: &App, f: &mut Frame, area: Rect, snap: &ReplaySnap) {
+    #[allow(non_snake_case)]
+    let CELL_W = app.cfg.cell_w as usize;
+    #[allow(non_snake_case)]
+    let CELL_H = app.cfg.cell_h as usize;
     let th      = app.cfg.theme;
     let flipped = app.flipped();
     let row_ord: Vec<usize> = if flipped{(0..8).rev().collect()}else{(0..8).collect()};
@@ -938,6 +1108,65 @@ fn eval_sparkline(eval_history: &[i32], width: usize) -> (String, Vec<Color>) {
         colors.push(col);
     }
     (out, colors)
+}
+
+
+// ── VERTICAL EVAL BAR ─────────────────────────────────────────────────────────
+// Shows who is better — like chess.com's vertical bar on the left of the board.
+// eval_cp: White-positive centipawns. Positive = White better, Negative = Black better.
+fn draw_eval_bar(eval_cp: i32, busy: bool, f: &mut Frame, area: Rect) {
+    let total = area.height as i32;
+    if total < 4 { return; }
+
+    // Clamp eval to ±10 pawns, map to 0..total (0=Black winning, total=White winning)
+    let clamped = (eval_cp.max(-1000).min(1000)) as f32 / 100.0; // -10..10
+    let frac    = ((clamped + 10.0) / 20.0).clamp(0.0, 1.0);      // 0..1
+    // White is at the BOTTOM of the bar (rank 1), Black at top
+    let white_rows = ((frac * total as f32) as i32).max(1).min(total - 1);
+    let black_rows = total - white_rows;
+
+    let mut lines: Vec<Line> = vec![];
+
+    // Black section (top)
+    for i in 0..black_rows as usize {
+        let is_first = i == 0;
+        let lbl = if is_first && !busy {
+            let p = eval_cp.abs() as f32 / 100.0;
+            if eval_cp < -20 { format!("{:.1}", p) } else { " ".to_string() }
+        } else { " ".to_string() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<4}", lbl),
+                Style::default().bg(Color::Rgb(20,20,20)).fg(Color::Rgb(200,200,200)))
+        ]));
+    }
+
+    // White section (bottom)
+    for i in 0..white_rows as usize {
+        let is_last = i == white_rows as usize - 1;
+        let lbl = if is_last && !busy {
+            let p = eval_cp as f32 / 100.0;
+            if eval_cp > 20 { format!("{:.1}", p) } else { " ".to_string() }
+        } else { " ".to_string() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<4}", lbl),
+                Style::default().bg(Color::Rgb(230,230,210)).fg(Color::Rgb(30,30,30)))
+        ]));
+    }
+
+    // If equal or busy show a tiny indicator in the middle
+    if busy || eval_cp.abs() < 20 {
+        let mid = (total / 2) as usize;
+        if mid < lines.len() {
+            let lbl = if busy { "~   " } else { "=   " };
+            lines[mid] = Line::from(vec![
+                Span::styled(lbl, Style::default()
+                    .bg(Color::Rgb(120,120,80)).fg(Color::Rgb(240,220,40))
+                    .add_modifier(Modifier::BOLD))
+            ]);
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_replay_sidebar(app: &App, f: &mut Frame, area: Rect) {
@@ -1560,7 +1789,8 @@ fn draw_puzzle(app: &App, f: &mut Frame) {
         }
         state => {
             // Puzzle is loaded — show board + info panel
-            let bw = (3 + 8 * CELL_W as u16 + 3 + 2).min(a.width);
+            let cell_w = app.cfg.cell_w as u16;
+            let bw = (3 + 8 * cell_w + 3 + 2).min(a.width);
             let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(a);
             let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Min(0)]).areas(body);
 

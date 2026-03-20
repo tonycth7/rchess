@@ -5,12 +5,12 @@ use std::path::PathBuf;
 // ── Theme ─────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
-    Classic, Tournament, Mocha, Slate, Midnight, Crimson,
+    Classic, Tournament, Mocha, Slate, Midnight, Crimson, MatteBlack, Ocean,
 }
 impl Theme {
     pub const ALL: &'static [Theme] = &[
         Theme::Classic, Theme::Tournament, Theme::Mocha,
-        Theme::Slate,   Theme::Midnight,   Theme::Crimson,
+        Theme::Slate,   Theme::Midnight,   Theme::Crimson, Theme::MatteBlack, Theme::Ocean,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -20,6 +20,8 @@ impl Theme {
             Theme::Slate       => "Slate        (grey/cyan)",
             Theme::Midnight    => "Midnight     (navy/purple)",
             Theme::Crimson     => "Crimson      (red/white)",
+            Theme::MatteBlack  => "Matte Black  (dark grey/gold)",
+            Theme::Ocean       => "Ocean        (navy/cyan)",
         }
     }
     pub fn squares(self) -> ((u8,u8,u8),(u8,u8,u8)) {
@@ -30,6 +32,8 @@ impl Theme {
             Theme::Slate      => (( 90,110,130),( 50, 65, 80)),
             Theme::Midnight   => (( 60, 60,120),( 30, 30, 70)),
             Theme::Crimson    => ((160, 60, 60),( 90, 30, 30)),
+            Theme::MatteBlack => (( 55, 55, 55),( 22, 22, 22)),
+            Theme::Ocean      => (( 40, 70,110),( 15, 35, 65)),
         }
     }
     pub fn accent(self) -> (u8,u8,u8) {
@@ -40,6 +44,8 @@ impl Theme {
             Theme::Slate      => ( 80,200,200),
             Theme::Midnight   => (160,100,220),
             Theme::Crimson    => (240,200,200),
+            Theme::MatteBlack => (200,160, 30),
+            Theme::Ocean      => ( 40,220,220),
         }
     }
     pub fn select(self) -> (u8,u8,u8) {
@@ -50,23 +56,31 @@ impl Theme {
             Theme::Slate      => ( 60,180,180),
             Theme::Midnight   => (120, 80,200),
             Theme::Crimson    => (220, 80, 80),
+            Theme::MatteBlack => (180,140, 20),
+            Theme::Ocean      => ( 20,180,200),
         }
     }
     pub fn cursor(self) -> (u8,u8,u8) {
         match self {
-            Theme::Classic => (246,246,130),
-            _              => ( 60,110, 80),
+            Theme::MatteBlack => (220,180, 30),
+            Theme::Ocean      => ( 50,230,230),
+            _              => (200,180, 50),
         }
     }
     pub fn last_move(self) -> (u8,u8,u8) {
         match self {
-            Theme::Classic => (206,210, 90),
+            Theme::MatteBlack => (160,130, 20),
+            Theme::Ocean      => ( 30,160,180),
+            _ => (160,140, 30),
             _              => self.accent(),
         }
     }
     pub fn piece_colors(self) -> ((u8,u8,u8),(u8,u8,u8)) {
         match self {
-            Theme::Classic => ((255,255,255),(10,10,10)),
+            Theme::MatteBlack => ((240,230,200),(190,190,195)),  // warm ivory / bright silver
+            Theme::Ocean      => ((240,250,255),( 20, 60,120)),
+            Theme::Classic => ((255,248,220),(15,10,5)),  // warm cream white / near-black
+            _ => ((240,240,240),(15,15,15)),
             _              => ((240,235,210),(28,18, 8)),
         }
     }
@@ -78,22 +92,25 @@ impl Theme {
             Theme::Slate      => ((16, 20, 28),(22, 28, 40)),
             Theme::Midnight   => (( 8,  8, 20),(14, 14, 32)),
             Theme::Crimson    => ((28,  8,  8),(42, 14, 14)),
+            Theme::MatteBlack => (( 8,  8,  8),(16, 16, 16)),
+            Theme::Ocean      => (( 5, 15, 35),(10, 22, 50)),
         }
     }
 }
 
 // ── PieceStyle ────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PieceStyle { Unicode, Letters, FatLetters }
+pub enum PieceStyle { Unicode, Letters, FatLetters, Blocks }
 impl PieceStyle {
     pub const ALL: &'static [PieceStyle] = &[
-        PieceStyle::Unicode, PieceStyle::Letters, PieceStyle::FatLetters,
+        PieceStyle::Unicode, PieceStyle::Letters, PieceStyle::FatLetters, PieceStyle::Blocks,
     ];
     pub fn name(self) -> &'static str {
         match self {
             PieceStyle::Unicode    => "Unicode symbols  \u{2654}\u{2655}\u{2656}\u{2657}\u{2658}\u{2659}",
             PieceStyle::Letters    => "ASCII letters    K Q R B N P",
             PieceStyle::FatLetters => "Bracketed        [K][Q][R]\u{2026}",
+            PieceStyle::Blocks      => "Block art        \u{2588}\u{2588}\u{2588} (big pieces)",
         }
     }
     pub fn render(self, sym: &'static str, letter: char, is_white: bool) -> String {
@@ -103,6 +120,7 @@ impl PieceStyle {
                 let c = if is_white { letter.to_ascii_uppercase() } else { letter.to_ascii_lowercase() };
                 c.to_string()
             }
+            PieceStyle::Blocks     => sym.to_string(), // unused — handled in draw_board
             PieceStyle::FatLetters => {
                 let c = if is_white { letter.to_ascii_uppercase() } else { letter.to_ascii_lowercase() };
                 format!("[{}]", c)
@@ -263,6 +281,12 @@ pub struct Config {
     pub analysis_engine: AnalysisEngine,
     /// Depth for built-in analysis engine (1=fast, 2=balanced, 3=strong)
     pub analysis_depth: u8,
+    /// Highlight brightness 0-10 (0=subtle, 5=default, 10=vivid)
+    pub highlight_brightness: u8,
+    /// Board cell width in chars (default 8). Increase to make board bigger.
+    pub cell_w: u8,
+    /// Board cell height in lines (default 4). Keep cell_w ≈ cell_h*2 for square cells.
+    pub cell_h: u8,
 }
 
 impl Default for Config {
@@ -287,6 +311,9 @@ impl Default for Config {
             stockfish_skill:  10,
             analysis_engine: AnalysisEngine::Builtin,
             analysis_depth: 2,
+            highlight_brightness: 5,
+            cell_w: 8,
+            cell_h: 4,
         }
     }
 }
@@ -309,11 +336,14 @@ impl Config {
                             "slate"      => Theme::Slate,
                             "midnight"   => Theme::Midnight,
                             "crimson"    => Theme::Crimson,
+                            "matteblack" => Theme::MatteBlack,
+                            "ocean"      => Theme::Ocean,
                             _            => Theme::Tournament,
                         },
                         "piece_style" => cfg.piece_style = match val {
                             "letters"    => PieceStyle::Letters,
                             "fatletters" => PieceStyle::FatLetters,
+                            "blocks"     => PieceStyle::Blocks,
                             _            => PieceStyle::Unicode,
                         },
                         "ai_depth"     => cfg.ai_depth    = val.parse().unwrap_or(AiDepth::Hard),
@@ -350,6 +380,9 @@ impl Config {
                             _           => AnalysisEngine::Builtin,
                         },
                         "analysis_depth" => cfg.analysis_depth = val.parse::<u8>().unwrap_or(2).clamp(1, 3),
+                        "highlight_brightness" => cfg.highlight_brightness = val.parse::<u8>().unwrap_or(5).clamp(0, 10),
+                        "cell_w" => cfg.cell_w = val.parse::<u8>().unwrap_or(8).clamp(4, 20),
+                        "cell_h" => cfg.cell_h = val.parse::<u8>().unwrap_or(4).clamp(2, 10),
                         _ => {}
                     }
                 }
@@ -389,15 +422,18 @@ impl Config {
                  inaccuracy_cp    = {}\n\
                  stockfish_skill  = {}\n\
                  analysis_engine  = {}\n\
-                 analysis_depth   = {}\n",
+                 analysis_depth   = {}\n\
+                 highlight_brightness = {}\n\
+                 cell_w           = {}\n\
+                 cell_h           = {}\n",
                 match self.theme {
                     Theme::Classic=>"classic", Theme::Tournament=>"tournament",
                     Theme::Mocha=>"mocha",    Theme::Slate=>"slate",
-                    Theme::Midnight=>"midnight", Theme::Crimson=>"crimson",
+                    Theme::Midnight=>"midnight", Theme::Crimson=>"crimson", Theme::MatteBlack=>"matteblack", Theme::Ocean=>"ocean",
                 },
                 match self.piece_style {
                     PieceStyle::Unicode=>"unicode", PieceStyle::Letters=>"letters",
-                    PieceStyle::FatLetters=>"fatletters",
+                    PieceStyle::FatLetters=>"fatletters", PieceStyle::Blocks=>"blocks",
                 },
                 self.ai_depth.depth(),
                 match self.move_hints {
@@ -424,6 +460,8 @@ impl Config {
                     AnalysisEngine::Stockfish=>"stockfish",
                 },
                 self.analysis_depth,
+                self.highlight_brightness,
+                self.cell_w, self.cell_h,
             ));
         }
     }

@@ -317,7 +317,18 @@ impl App {
             match rx.try_recv() {
                 Ok(mv) => {
                     self.thinking = false; self.ai_rx = None;
-                    if let Some(mv) = mv { self.execute(mv); }
+                    if let Some(mv) = mv {
+                        // Safety: verify move is legal before executing
+                        // (guards against stale board state in threaded context)
+                        let legal_moves = crate::engine::legal(
+                            &self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast
+                        );
+                        if legal_moves.iter().any(|m| m.fr == mv.fr && m.to == mv.to && m.promo == mv.promo) {
+                            self.execute(mv);
+                        } else {
+                            rlog!("[rchess/ai] ILLEGAL move filtered: {:?} turn={:?}", mv, self.gs.turn);
+                        }
+                    }
                 }
                 Err(TryRecvError::Disconnected) => { self.thinking = false; self.ai_rx = None; }
                 Err(TryRecvError::Empty) => {}
@@ -687,10 +698,10 @@ impl App {
     pub fn handle_settings_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Up   | KeyCode::Char('k') => { if self.settings_cur > 0  { self.settings_cur -= 1; } }
-            KeyCode::Down | KeyCode::Char('j') => { if self.settings_cur < 13 { self.settings_cur += 1; } }
+            KeyCode::Down | KeyCode::Char('j') => { if self.settings_cur < 17 { self.settings_cur += 1; } }
             KeyCode::Left | KeyCode::Char('h') => self.settings_cycle(false),
             KeyCode::Right| KeyCode::Char('l') => self.settings_cycle(true),
-            KeyCode::Char('w') | KeyCode::Char('s') => { self.cfg.save(); self.saved_notice = Some(40); }
+            KeyCode::Char('w') | KeyCode::Char('s') => { self.cfg.save(); self.saved_notice = Some(120); }
             KeyCode::Char('r') => self.cfg = Config::default(),
             KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
             _ => {}
@@ -717,6 +728,12 @@ impl App {
             10 => self.cfg.ui_mode         = cyc(UiMode::ALL,         self.cfg.ui_mode,         fwd),
             11 => self.cfg.analysis_engine = cyc(AnalysisEngine::ALL, self.cfg.analysis_engine, fwd),
             13 => self.cfg.auto_save_png   = !self.cfg.auto_save_png,
+            14 => {
+                let cur = self.cfg.highlight_brightness as i16;
+                self.cfg.highlight_brightness = if fwd { (cur + 1).min(10) as u8 } else { (cur - 1).max(0) as u8 };
+            }
+            15 => self.cfg.cell_w = if fwd { (self.cfg.cell_w + 1).min(20) } else { self.cfg.cell_w.saturating_sub(1).max(4) },
+            16 => self.cfg.cell_h = if fwd { (self.cfg.cell_h + 1).min(10) } else { self.cfg.cell_h.saturating_sub(1).max(2) },
             12 => self.cfg.analysis_depth = if fwd {
                        (self.cfg.analysis_depth % 3) + 1
                    } else {
@@ -874,8 +891,9 @@ impl App {
                     || self.gs.clock_state == ClockState::Flagged;
         let human = is_puzzle || self.mode == Mode::PvP || self.gs.turn == self.player_color;
         if !human || over || self.thinking { return; }
-        // These MUST match CELL_W and CELL_H in ui.rs
-        const CELL_W: usize = 9; const CELL_H: usize = 5;
+        // Read from config — must stay in sync with draw_board
+        let cell_w: usize = self.cfg.cell_w as usize;
+        let cell_h: usize = self.cfg.cell_h as usize;
         // Row 0 = top bar, row 1 = board border top
         // Then optional coord row, then 8*CELL_H board rows
         const TOP_BAR: usize = 1;
@@ -888,8 +906,8 @@ impl App {
         let cell_start_col = BORDER + coord_cols;
 
         if row < cell_start_row || col < cell_start_col { return; }
-        let board_row = (row - cell_start_row) / CELL_H;
-        let board_col = (col - cell_start_col) / CELL_W;
+        let board_row = (row - cell_start_row) / cell_h;
+        let board_col = (col - cell_start_col) / cell_w;
         if board_row > 7 || board_col > 7 { return; }
         let (r, c) = if self.flipped() { (7 - board_row, 7 - board_col) } else { (board_row, board_col) };
         self.do_select((r, c));
