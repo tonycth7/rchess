@@ -14,6 +14,7 @@ mod ui;
 mod png_export;
 mod analysis;
 mod network;
+mod chat;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -102,9 +103,14 @@ fn main() -> io::Result<()> {
                         Screen::FenInput    => app.handle_fen_input_key(key.code),
                         Screen::PgnImport   => app.handle_pgn_import_key(key.code),
                         Screen::Puzzle      => app.handle_puzzle_key(key.code),
+                        Screen::PuzzlePicker => app.handle_puzzle_picker_key(key.code),
                         Screen::PgnSaved    => { app.screen = Screen::Game; }  // any key closes
                         Screen::OnlineSetup   => app.handle_online_setup_key(key.code),
                         Screen::OnlineWaiting => app.handle_online_waiting_key(key.code),
+                        Screen::OnlineLobby   => app.handle_online_lobby_key(key.code),
+                        Screen::UndoOffer     => app.handle_undo_offer_key(key.code),
+                        Screen::ServerPanel   => app.handle_server_panel_key(key.code),
+                        Screen::OnlineAuth    => app.handle_online_auth_key(key.code),
                     }
                 }
                 // ── Mouse ─────────────────────────────────────────────────────

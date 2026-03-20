@@ -61,8 +61,13 @@ pub fn render(app: &App, f: &mut Frame) {
         Screen::FenInput    => draw_fen_input(app, f),
         Screen::PgnImport   => draw_pgn_import(app, f),
         Screen::Puzzle      => draw_puzzle(app, f),
+        Screen::PuzzlePicker => draw_puzzle_picker(app, f),
         Screen::OnlineSetup   => draw_online_setup(app, f),
         Screen::OnlineWaiting => draw_online_waiting(app, f),
+        Screen::OnlineLobby   => draw_online_lobby(app, f),
+        Screen::UndoOffer     => { draw_game(app, f); draw_undo_offer(app, f); }
+        Screen::ServerPanel   => { draw_game(app, f); draw_server_panel(app, f); }
+        Screen::OnlineAuth    => draw_online_auth(app, f),
     }
 }
 
@@ -334,8 +339,13 @@ fn draw_topbar(app: &App, f: &mut Frame, area: Rect) {
     let th = app.cfg.theme;
     let mode_s = match app.mode {
         Mode::PvP    => "TWO PLAYERS".to_string(),
-        Mode::Online => format!("ONLINE  [YOU:{}]",
-            app.online_color.map(|c| c.name()).unwrap_or("?")),
+        Mode::Online => {
+            let ping  = app.ping_ms.map(|ms| format!(" {ms}ms")).unwrap_or_default();
+            let chat  = app.chat.badge();
+            let conn  = if app.online_opp_connected { "🟢" } else { "🔴" };
+            format!("ONLINE {conn} [YOU:{}]{ping}{chat}  [P=panel]",
+                app.online_color.map(|c| c.name()).unwrap_or("?"))
+        }
         Mode::CPU    => format!("VS CPU [YOU:{}] [{}]",
             app.player_color.name(),
             app.cfg.ai_depth.name().split_whitespace().next().unwrap_or("")),
@@ -538,6 +548,19 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
     } else { String::new() };
     let dm_hint  = if let Some(msg)=&app.draw_offer_msg { format!("  {}", msg) } else { String::new() };
 
+    // Online status line: show disconnect warning or undo-pending notice
+    let online_banner: Option<(&str, Color)> = if app.mode == Mode::Online {
+        if !app.online_opp_connected {
+            Some(("  ⚠  Opponent disconnected — waiting for reconnect…", Color::Yellow))
+        } else if app.undo_offer_pending {
+            Some(("  ⏳  Undo request sent — waiting for reply…", Color::Cyan))
+        } else if !app.online_msg.is_empty() {
+            Some((&app.online_msg, Color::Yellow))
+        } else {
+            None
+        }
+    } else { None };
+
     let (input_line, input_col) = if !app.input_buf.is_empty() {
         (format!("  [{}]  {}{}█", cur_name, sel_str, app.input_buf), CREAM)
     } else if app.selected.is_some() {
@@ -555,11 +578,15 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
     };
 
     let border_col = if !app.input_buf.is_empty(){ac(th)} else if app.input_err.is_some(){RED} else {DIM};
+    let mut panel_lines = vec![
+        Line::from(vec![Span::styled(input_line, sty(input_col).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(hint_line, sty(hint_col))]),
+    ];
+    if let Some((banner_text, banner_col)) = online_banner {
+        panel_lines.push(Line::from(vec![Span::styled(banner_text.to_string(), Style::default().fg(banner_col))]));
+    }
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![Span::styled(input_line, sty(input_col).add_modifier(Modifier::BOLD))]),
-            Line::from(vec![Span::styled(hint_line, sty(hint_col))]),
-        ]).block(
+        Paragraph::new(panel_lines).block(
             Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
                 .border_style(sty(border_col)).style(Style::default().bg(bg1(th)))
         ),
@@ -1786,7 +1813,7 @@ fn draw_puzzle(app: &App, f: &mut Frame) {
             lines.push(Line::from(vec![Span::styled(&sep, sty(DIMMER))]));
             lines.push(Line::from(vec![
                 Span::styled(" n ", sty(GREEN).add_modifier(Modifier::BOLD)),
-                Span::styled(" retry    ", sty(DIM)),
+                Span::styled(" new puzzle    ", sty(DIM)),
                 Span::styled(" Esc ", sty(DIM)),
                 Span::styled(" back to menu", sty(DIM)),
             ]));
@@ -1905,42 +1932,41 @@ fn draw_puzzle_sidebar(app: &App, f: &mut Frame, area: Rect) {
     ]).block(panel_block("KEYS", th)), keys_area);
 }
 
+
 // ── ONLINE SETUP ──────────────────────────────────────────────────────────────
 fn draw_online_setup(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
-    let rect = center(60, 22, f.area());
+    let has_session = app.has_session;
+    let h = if app.online_step == OnlineStep::ChooseAction && has_session { 28u16 } else { 24 };
+    let rect  = center(62, h, f.area());
     f.render_widget(
         Block::default().borders(Borders::ALL).border_type(BorderType::Double)
             .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
         rect,
     );
     let inner = pad(rect, 2, 1);
-
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled("  ⚡ ONLINE VS FRIEND", sty(ac(th)).add_modifier(Modifier::BOLD))]),
         Line::from(vec![Span::styled("  Real-time multiplayer over TCP", sty(DIM))]),
         Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]),
         Line::from(""),
     ];
-
     match app.online_step {
         OnlineStep::EnterAddr => {
             lines.push(Line::from(vec![Span::styled("  SERVER ADDRESS", sty(DIM))]));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("  ▶ ", sty(ac(th))),
-                Span::styled(
-                    format!("{:<50}", &app.online_buf),
-                    Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(format!("{:<52}", &app.online_buf),
+                    Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)),
             ]));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled("  Default: 127.0.0.1:9001 (local)", sty(DIMMER))]));
-            lines.push(Line::from(vec![Span::styled("  Use your host's public IP for cross-network play", sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled("  Default: 127.0.0.1:9001 (local test)", sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled("  Public: yourserver.fly.dev:9001 or IP:9001", sty(DIMMER))]));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled("  Enter confirm    Esc back to menu", sty(DIMMER))]));
         }
@@ -1950,45 +1976,139 @@ fn draw_online_setup(app: &App, f: &mut Frame) {
                 Span::styled(&app.online_buf, sty(ac(th))),
             ]));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]));
             lines.push(Line::from(""));
+            // Always-visible options
             for (key, label, desc) in [
-                ("C", "CREATE ROOM", "Get a code to share with your friend"),
-                ("J", "JOIN ROOM  ", "Enter a code your friend shared"),
+                ("C", "CREATE ROOM", "Configure rules → get a code to share"),
+                ("J", "JOIN ROOM  ", "Enter the code your friend gave you"),
+                ("L", "LOCAL HOST ", "Start server here + create a room"),
             ] {
                 lines.push(Line::from(vec![
                     Span::styled(format!("  [{key}]  "), sty(ac(th)).add_modifier(Modifier::BOLD)),
-                    Span::styled(label, sty(CREAM).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{:<14}", label), sty(CREAM).add_modifier(Modifier::BOLD)),
+                    Span::styled(desc, sty(DIM)),
                 ]));
-                lines.push(Line::from(vec![Span::styled(format!("        {desc}"), sty(DIM))]));
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            if has_session {
+                if let Some((code, color)) = &app.session_display {
+                    lines.push(Line::from(vec![
+                        Span::styled("  [R]  ", sty(ac(th)).add_modifier(Modifier::BOLD)),
+                        Span::styled("REJOIN LAST GAME", sty(CREAM).add_modifier(Modifier::BOLD)),
+                    ]));
+                    lines.push(Line::from(vec![Span::styled(
+                        format!("        Room {} as {}", code, color.to_uppercase()), sty(DIM))]));
+                    lines.push(Line::from(""));
+                }
+            }
+            if has_session {
+                if let Some((code, color)) = &app.session_display {
+                    lines.push(Line::from(vec![
+                        Span::styled("  [X]  ", sty(RED).add_modifier(Modifier::BOLD)),
+                        Span::styled("CLEAR SESSION ", sty(CREAM).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("(room {} as {})", code, color.to_uppercase()), sty(DIM)),
+                    ]));
+                    lines.push(Line::from(""));
+                }
+            }
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]));
             lines.push(Line::from(""));
+            if app.local_server_pid.is_some() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  🖥 Local server running (PID {})", app.local_server_pid.unwrap()),
+                    Style::default().fg(Color::Green))]));
+                lines.push(Line::from(""));
+            }
             lines.push(Line::from(vec![Span::styled("  Esc go back", sty(DIMMER))]));
         }
         OnlineStep::EnterRoom => {
-            lines.push(Line::from(vec![Span::styled("  ENTER ROOM CODE", sty(DIM))]));
+            let is_link = app.online_buf.starts_with("rc1:");
+            let label   = if is_link { "  ▶ INVITE LINK DETECTED" } else { "  ▶ ENTER CODE OR LINK" };
+            lines.push(Line::from(vec![Span::styled(label, sty(ac(th)).add_modifier(Modifier::BOLD))]));
             lines.push(Line::from(""));
+            let disp_buf = if app.online_buf.len() > 52 {
+                format!("{}…", &app.online_buf[..50])
+            } else {
+                format!("{:<52}", &app.online_buf)
+            };
             lines.push(Line::from(vec![
-                Span::styled("  ▶ ", sty(ac(th))),
-                Span::styled(
-                    format!("{:<8}", &app.online_buf),
-                    Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("  ", sty(DIM)),
+                Span::styled(disp_buf,
+                    Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)),
             ]));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled("  Ask your friend for their 6-char room code", sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled("  Type a 6-char room code  OR  paste an rc1:… invite link", sty(DIM))]));
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled("  Enter join    Esc back", sty(DIMMER))]));
         }
         OnlineStep::Connecting => {
-            lines.push(Line::from(vec![Span::styled("  Connecting…", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+            lines.push(Line::from(vec![Span::styled("  Connecting to server…", sty(ac(th)))]));
         }
     }
+    if !app.online_msg.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  ⚠  {}", app.online_msg), Style::default().fg(Color::Yellow))]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
+// ── ONLINE LOBBY (rule picker, creator only) ───────────────────────────────────
+fn draw_online_lobby(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let rect = center(62, 28, f.area());
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
+        rect,
+    );
+    let inner = pad(rect, 2, 1);
+    let opts  = &app.online_opts;
+    let rows: &[(&str, String)] = &[
+        ("Time Control",    opts.time_label().to_string()),
+        ("Increment",       opts.inc_label()),
+        ("Allow Undo",      if opts.undo_allowed       { "Yes".into() } else { "No".into() }),
+        ("Engine Analysis", if opts.engine_during_game { "On (both see it)".into() } else { "Off (fair play)".into() }),
+    ];
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  ⚡ GAME RULES", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled("  Server: ", sty(DIM)),
+            Span::styled(
+                if app.online_server_addr.is_empty() { "not set — go back!".to_string() }
+                else { app.online_server_addr.clone() },
+                sty(if app.online_server_addr.is_empty() { RED } else { CREAM }),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]),
+        Line::from(""),
+    ];
+    for (i, (label, val)) in rows.iter().enumerate() {
+        let sel = app.lobby_cur == i;
+        lines.push(Line::from(vec![
+            Span::styled(if sel { " ▶ " } else { "   " }, sty(ac(th))),
+            Span::styled(format!("{:<22}", label), sty(if sel { CREAM } else { DIM })),
+            Span::styled(
+                format!("◀ {:<20} ▶", val),
+                if sel { Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD) }
+                else   { sty(CREAM) },
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Enter ", sty(ac(th)).add_modifier(Modifier::BOLD)),
+        Span::styled("create room    ", sty(CREAM)),
+        Span::styled("↑↓ navigate    ◀▶ change    Esc back", sty(DIMMER)),
+    ]));
+    // Error / status line — always visible at bottom of lobby
     if !app.online_msg.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
@@ -1996,63 +2116,455 @@ fn draw_online_setup(app: &App, f: &mut Frame) {
             Style::default().fg(Color::Yellow),
         )]));
     }
-
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── ONLINE WAITING ────────────────────────────────────────────────────────────
 fn draw_online_waiting(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
-    let rect = center(58, 20, f.area());
+    // Use FULL available area — never clip content
+    let area = f.area();
+    f.render_widget(Block::default().style(Style::default().bg(bg0(th))), area);
+
+    let spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+    let spin    = spinner[(app.online_ping_tick as usize / 5) % spinner.len()];
+    let has_code = !app.online_room_code.is_empty();
+
+    // Layout: top bar | main content | bottom hint
+    let [topbar, body, hint] = ratatui::layout::Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ]).areas(area);
+
+    // Top bar: server name + status
+    let srv = if app.server_info.name.is_empty() { "RChess" } else { &app.server_info.name };
+    let status_text = if has_code {
+        format!(" ⚡ {}  ─  Waiting for opponent…  {spin}", srv)
+    } else {
+        format!(" ⚡ {}  ─  {}  {spin}", srv, app.online_msg)
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(status_text, Style::default().fg(ac(th)).bg(bg1(th)))),
+        topbar,
+    );
+
+    // Hint bar
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "  Esc cancel",
+            Style::default().fg(DIMMER),
+        )),
+        hint,
+    );
+
+    // Body: centered content
+    let [_, center, _] = ratatui::layout::Layout::horizontal([
+        Constraint::Min(2),
+        Constraint::Length(body.width.min(66)),
+        Constraint::Min(2),
+    ]).areas(body);
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    if has_code {
+        // ── BIG ROOM CODE ─────────────────────────────────────────────────────
+        lines.push(Line::from(vec![Span::styled(
+            "  YOUR ROOM CODE — share with your friend",
+            sty(DIM),
+        )]));
+        lines.push(Line::from(""));
+
+        // Giant code display
+        let code = &app.online_room_code;
+        let pad_l = " ".repeat((center.width.saturating_sub(code.len() as u16 + 10) / 2) as usize);
+        lines.push(Line::from(vec![
+            Span::styled(pad_l, sty(DIM)),
+            Span::styled(
+                format!("  ★  {code}  ★  "),
+                Style::default()
+                    .fg(bg0(th))
+                    .bg(ac(th))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
+        // Rules summary
+        let o = &app.online_opts;
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {} time  +{}s increment  undo: {}  engine: {}",
+                o.time_label(), o.increment_secs,
+                if o.undo_allowed { "allowed" } else { "off" },
+                if o.engine_during_game { "on" } else { "off (fair)" }),
+            sty(DIMMER),
+        )]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {:─<60}", ""), sty(DIMMER))]));
+        lines.push(Line::from(""));
+
+        if let Some(pid) = app.local_server_pid {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  🖥  Local server PID {pid}  ·  Admin: http://127.0.0.1:9002"),
+                Style::default().fg(Color::Green),
+            )]));
+            lines.push(Line::from(""));
+        }
+
+        if !app.server_info.motd.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  📢  {}", app.server_info.motd), sty(DIMMER))]));
+            lines.push(Line::from(""));
+        }
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {spin}  Waiting for friend to connect with code {code}…"),
+            sty(ac(th)),
+        )]));
+
+        // ── Invite link section ───────────────────────────────────────────────
+        if !app.online_invite_link.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "  ── INVITE LINK (paste or type into any rchess TUI) ──",
+                sty(DIMMER),
+            )]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ", sty(DIM)),
+                Span::styled(
+                    format!("  {}  ", app.online_invite_link),
+                    Style::default().fg(Color::Rgb(80,200,160)).bg(Color::Rgb(10,30,25))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "  Friend enters: Online → Join → paste this link",
+                sty(DIMMER),
+            )]));
+        } else {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "  Friend should: Online → Join → enter code above",
+                sty(DIMMER),
+            )]));
+        }
+
+    } else {
+        // ── No code yet — connecting ───────────────────────────────────────────
+        lines.push(Line::from(vec![Span::styled("  ⚡ ONLINE", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {spin}  {}", if app.online_msg.is_empty() { "Connecting…".to_string() } else { app.online_msg.clone() }),
+            sty(ac(th)),
+        )]));
+        lines.push(Line::from(""));
+
+        if !app.server_info.name.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  Server  ", sty(DIM)),
+                Span::styled(&app.server_info.name, sty(CREAM)),
+                Span::styled(
+                    format!("  ·  {} active room{}", app.server_info.active_rooms,
+                        if app.server_info.active_rooms == 1 {""} else {"s"}),
+                    sty(DIMMER)),
+            ]));
+        }
+
+        if let Some(pid) = app.local_server_pid {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  🖥  Local server running (PID {pid})"),
+                Style::default().fg(Color::Green),
+            )]));
+        }
+    }
+
+    f.render_widget(Paragraph::new(lines), center);
+}
+
+
+// ── UNDO OFFER ────────────────────────────────────────────────────────────────
+fn draw_undo_offer(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let rect = center(50, 12, f.area());
+    f.render_widget(Clear, rect);
     f.render_widget(
         Block::default().borders(Borders::ALL).border_type(BorderType::Double)
             .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
         rect,
     );
     let inner = pad(rect, 2, 1);
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  UNDO REQUEST", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Opponent wants to undo their last move.", sty(CREAM))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<44}", ""), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Y] Accept", sty(ac(th)).add_modifier(Modifier::BOLD)),
+            Span::styled("    ", sty(DIM)),
+            Span::styled("[N / Esc] Decline", sty(DIM)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
-    // Spinner animation based on tick (online_ping_tick cycles 0-99)
-    let spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
-    let spin = spinner[(app.online_ping_tick as usize / 5) % spinner.len()];
+// ── SERVER PANEL ──────────────────────────────────────────────────────────────
+fn draw_server_panel(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let area = f.area();
 
-    let mut lines = vec![
+    // Right-side slide-in panel: 45 cols wide, full height, doesn't cover board
+    let pw   = 46u16.min(area.width.saturating_sub(2));
+    let rect = Rect {
+        x:      area.width.saturating_sub(pw),
+        y:      0,
+        width:  pw,
+        height: area.height,
+    };
+    f.render_widget(ratatui::widgets::Clear, rect);
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
+        rect,
+    );
+    let inner = Rect {
+        x: rect.x + 1, y: rect.y + 1,
+        width:  rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+
+    let [header_area, chat_area] = Layout::vertical([
+        Constraint::Length(10),
+        Constraint::Min(4),
+    ]).areas(inner);
+
+    let ping_str  = app.ping_ms.map(|ms| format!("{}ms", ms)).unwrap_or_else(|| "—".into());
+    let opp_conn  = if app.online_opp_connected { "● connected" } else { "○ away" };
+    let opp_col   = if app.online_opp_connected { GREEN } else { Color::Rgb(180,60,60) };
+    let color_str = app.online_color.map(|c| c.name()).unwrap_or("?");
+    let srv       = if app.server_info.name.is_empty() { "RChess" } else { &app.server_info.name };
+    let rules     = &app.online_opts;
+    let time_s    = if rules.time_secs == 0 { "∞".into() } else { format!("{}m", rules.time_secs/60) };
+    let opp_name  = if app.online_opp_name.is_empty() {
+        if color_str == "WHITE" { "Black".into() } else { "White".into() }
+    } else { app.online_opp_name.clone() };
+    let link_short = if app.online_invite_link.len() > 36 {
+        format!("{}…", &app.online_invite_link[..34])
+    } else { app.online_invite_link.clone() };
+
+    let info = vec![
+        Line::from(vec![
+            Span::styled(" ⚡ CHAT & INFO", sty(ac(th)).add_modifier(Modifier::BOLD)),
+            Span::styled("  Esc close", sty(DIMMER)),
+        ]),
         Line::from(""),
-        Line::from(vec![Span::styled("  ⚡ ONLINE  —  WAITING", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![
+            Span::styled(" Room  ", sty(DIM)),
+            Span::styled(&app.online_room_code, sty(ac(th)).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  you={}", color_str.to_lowercase()), sty(DIM)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Opp   ", sty(DIM)),
+            Span::styled(&opp_name, sty(CREAM)),
+            Span::styled("  ", sty(DIM)),
+            Span::styled(opp_conn, sty(opp_col)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Server", sty(DIM)),
+            Span::styled(format!(" {}  ping {}", srv, ping_str), sty(DIMMER)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Rules ", sty(DIM)),
+            Span::styled(format!("{}+{}s undo:{}", time_s, rules.increment_secs,
+                if rules.undo_allowed {"y"} else {"n"}), sty(DIMMER)),
+        ]),
+        Line::from(if link_short.is_empty() { vec![] } else {
+            vec![
+                Span::styled(" Link  ", sty(DIM)),
+                Span::styled(link_short, Style::default().fg(Color::Rgb(80,200,160))),
+            ]
+        }),
         Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<50}", ""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!(" {:─<40}", ""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(" [C] type  [Esc] close  [P] close", sty(DIMMER))]),
+    ];
+    f.render_widget(Paragraph::new(info), header_area);
+
+    let my_color_str = match app.online_color {
+        Some(crate::engine::Color::White) => "white",
+        Some(crate::engine::Color::Black) => "black",
+        None => "",
+    };
+    crate::chat::render(&app.chat, chat_area, f, ac(th), my_color_str);
+}
+
+
+// ── ONLINE AUTH ───────────────────────────────────────────────────────────────
+fn draw_online_auth(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let rect = center(54, 16, f.area());
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
+        rect,
+    );
+    let inner = pad(rect, 2, 1);
+    // Show password as asterisks
+    let masked: String = "*".repeat(app.server_pw_buf.len());
+    let lines = vec![
         Line::from(""),
+        Line::from(vec![Span::styled("  🔒 SERVER PASSWORD REQUIRED", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  Server: {}", app.online_server_addr), sty(DIM))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<48}", ""), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Password:", sty(DIM))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ▶ ", sty(ac(th))),
+            Span::styled(
+                format!("{:<44}", if masked.is_empty() { "type password…".to_string() } else { masked }),
+                if app.server_pw_buf.is_empty() {
+                    sty(DIMMER)
+                } else {
+                    Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)
+                },
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<48}", ""), sty(DIMMER))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Enter submit    Esc cancel", sty(DIMMER))]),
+    ];
+    if !app.online_msg.is_empty() {
+        let mut all = lines;
+        all.push(Line::from(vec![Span::styled(
+            format!("  ⚠ {}", app.online_msg), Style::default().fg(Color::Yellow))]));
+        f.render_widget(Paragraph::new(all), inner);
+    } else {
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+// ── PUZZLE PICKER ─────────────────────────────────────────────────────────────
+fn draw_puzzle_picker(app: &App, f: &mut Frame) {
+    let th = app.cfg.theme;
+    let a  = f.area();
+
+    const THEMES: &[(&str, &str)] = &[
+        ("",               "★  Daily Puzzle  — Lichess pick of the day"),
+        ("opening",        "♟  Opening"),
+        ("middlegame",     "⚔  Middlegame"),
+        ("endgame",        "♔  Endgame"),
+        ("fork",           "⑂  Fork"),
+        ("pin",            "📌  Pin"),
+        ("skewer",         "↔  Skewer"),
+        ("discoveredAttack","💥  Discovered Attack"),
+        ("sacrifice",      "🎁  Sacrifice"),
+        ("mateIn1",        "⚡  Mate in 1"),
+        ("mateIn2",        "⚡  Mate in 2"),
+        ("mateIn3",        "⚡  Mate in 3"),
+        ("crushing",       "💪  Crushing"),
+        ("equality",       "⚖  Equality / Defense"),
+    ];
+    const RATINGS: &[(&str, &str)] = &[
+        ("any",   "Any rating"),
+        ("easy",  "Beginner   (< 1200)"),
+        ("mid",   "Intermediate  (1200–1600)"),
+        ("adv",   "Advanced  (1600–2000)"),
+        ("exp",   "Expert  (2000–2400)"),
+        ("mast",  "Master  (2400+)"),
     ];
 
-    if !app.online_room_code.is_empty() {
-        lines.push(Line::from(vec![Span::styled("  YOUR ROOM CODE", sty(DIM))]));
-        lines.push(Line::from(""));
+    let theme_count  = THEMES.len();
+    let rating_count = RATINGS.len();
+    let total        = theme_count + rating_count + 1; // +1 GO
+    let cur          = app.puzzle_pick_cur;
+
+    let box_h = (4 + theme_count + 2 + rating_count + 3 + 2) as u16;
+    let box_h = box_h.min(a.height.saturating_sub(2));
+    let rect  = center(64, box_h, a);
+
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
+        rect,
+    );
+    let inner = pad(rect, 1, 0);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ★ CHOOSE PUZZLE", sty(ac(th)).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter = start immediately   ↑↓ navigate   Esc menu", sty(DIMMER)),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  ── THEME ──────────────────────────────────────────", sty(DIMMER))]),
+    ];
+
+    // Build theme rows
+    let mut global_idx = 0usize;
+    for (key, label) in THEMES.iter() {
+        let sel = cur == global_idx;
+        let is_active = *key == app.puzzle_theme.as_str();
+        let prefix = if sel { " ▶ " } else if is_active { " ✓ " } else { "   " };
+        let style = if sel {
+            Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)
+        } else if is_active {
+            Style::default().fg(ac(th))
+        } else {
+            sty(CREAM)
+        };
         lines.push(Line::from(vec![
-            Span::styled("       ", sty(DIM)),
-            Span::styled(
-                format!("  {}  ", app.online_room_code),
-                Style::default()
-                    .fg(bg0(th)).bg(ac(th))
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(prefix, if sel { sty(ac(th)) } else { sty(GREEN) }),
+            Span::styled(format!("{:<56}", label), style),
         ]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled("  Share this code with your friend", sty(DIMMER))]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(format!("  {:─<50}", ""), sty(DIMMER))]));
-        lines.push(Line::from(""));
+        global_idx += 1;
     }
 
-    // Status message
-    let status = if app.online_msg.is_empty() {
-        format!("{spin}  Connecting…")
-    } else {
-        format!("{spin}  {}", app.online_msg)
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled("  ── RATING RANGE ───────────────────────────────────", sty(DIMMER))]));
+    let rating_labels = ["Any rating", "Beginner  (< 1200)", "Intermediate  (1200–1600)",
+                          "Advanced  (1600–2000)", "Expert  (2000–2400)", "Master  (2400+)"];
+    let cur_rating_label = match (app.puzzle_rating_min, app.puzzle_rating_max) {
+        (0, 9999) => "Any rating",
+        (0, 1200) => "Beginner  (< 1200)",
+        (1200, 1600) => "Intermediate  (1200–1600)",
+        (1600, 2000) => "Advanced  (1600–2000)",
+        (2000, 2400) => "Expert  (2000–2400)",
+        _ => "Master  (2400+)",
     };
-    lines.push(Line::from(vec![Span::styled(format!("  {}", status), sty(ac(th)))]));
+    for label in rating_labels.iter() {
+        let sel = cur == global_idx;
+        let is_active = *label == cur_rating_label;
+        let prefix = if sel { " ▶ " } else if is_active { " ✓ " } else { "   " };
+        let style = if sel {
+            Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)
+        } else if is_active {
+            Style::default().fg(ac(th))
+        } else {
+            sty(CREAM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, if sel { sty(ac(th)) } else { sty(GREEN) }),
+            Span::styled(format!("{:<56}", label), style),
+        ]));
+        global_idx += 1;
+    }
+
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(format!("  {:─<50}", ""), sty(DIMMER))]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled("  Esc / q  cancel", sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<56}", ""), sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled(
+        "  ↑↓ or hjkl navigate   Enter to start   Esc back to menu", sty(DIMMER))]));
 
     f.render_widget(Paragraph::new(lines), inner);
 }

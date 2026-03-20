@@ -1,0 +1,299 @@
+# RChess Server — Deployment Guide
+
+## Quick Start (Local LAN Game)
+
+```bash
+# Build
+cargo build --release
+
+# Run server (auto-detects your LAN IP for invite links)
+./target/release/rchess-server
+
+# Client connects to your LAN IP
+./target/release/rchess
+# → Online → Create Room → share the rc1:… invite link with your friend
+# Friend: → Online → Join → paste the rc1:… link
+```
+
+---
+
+## How Invite Links Work
+
+When you create a room, the server generates an **invite link**:
+
+```
+rc1:bG9jYWxob3N0OjkwMDE6QUJDREVG
+```
+
+This is `rc1:` + base64url of `host:port:ROOMCODE`.
+
+Your friend pastes this into rchess → Online → Join (instead of typing a code).
+The TUI auto-decodes the host, port, and room code and connects directly.
+
+**No manual IP typing needed.**
+
+---
+
+## Server Options
+
+```
+rchess-server [OPTIONS]
+
+--host   <addr>     Bind address                 (default: 0.0.0.0)
+--port   <n>        Game TCP port                (default: 9001)
+--admin  <n>        Admin dashboard HTTP port    (default: 9002)
+--data   <dir>      Room persistence directory   (default: ./rchess_data)
+--pw     <pass>     Require password from clients
+--apw    <pass>     Admin dashboard password
+--name   <str>      Server display name
+--motd   <str>      Message of the day (shown to connecting clients)
+--ttl    <mins>     Room TTL after both disconnect (default: 120)
+--public <host>     Public hostname/IP for invite links
+--fresh             Delete all saved rooms on startup
+--help              Show help
+```
+
+**Config file** (auto-created): `~/.config/rchess/server.toml`
+
+---
+
+## Deployment Options
+
+### Option 1: Local (same machine / LAN)
+
+```bash
+./rchess-server
+# Server auto-detects LAN IP, puts it in invite links
+# Works immediately — share rc1:… link via chat/text
+```
+
+### Option 2: VPS / Cloud (public internet)
+
+```bash
+# With your domain or public IP
+./rchess-server --public chess.example.com --port 9001
+
+# Or in config file:
+echo 'public_host = "chess.example.com"' >> ~/.config/rchess/server.toml
+```
+
+Friends anywhere in the world paste the `rc1:…` link.
+
+### Option 3: Docker
+
+```bash
+# Build
+docker build -t rchess-server .
+
+# Run
+docker run -d \
+  --name rchess \
+  -p 9001:9001 \
+  -p 9002:9002 \
+  -v rchess_data:/app/rchess_data \
+  -e RCHESS_PUBLIC_HOST=chess.example.com \
+  rchess-server
+
+# With password
+docker run -d \
+  --name rchess \
+  -p 9001:9001 \
+  -p 9002:9002 \
+  -v rchess_data:/app/rchess_data \
+  rchess-server \
+    --public chess.example.com \
+    --apw mysecretadminpass \
+    --name "My Chess Server" \
+    --motd "Welcome! Games last 120min after disconnect."
+```
+
+### Option 4: Fly.io (free tier works)
+
+```bash
+fly launch   # follow prompts, use fly.toml
+fly deploy
+fly secrets set RCHESS_PUBLIC_HOST=myapp.fly.dev
+```
+
+The included `fly.toml` is pre-configured for ports 9001 + 9002.
+
+### Option 5: Systemd (production Linux)
+
+```ini
+# /etc/systemd/system/rchess.service
+[Unit]
+Description=RChess Relay Server
+After=network.target
+
+[Service]
+Type=simple
+User=rchess
+WorkingDirectory=/opt/rchess
+ExecStart=/opt/rchess/rchess-server \
+    --public chess.example.com \
+    --port 9001 \
+    --admin 9002 \
+    --data /var/lib/rchess \
+    --apw changeme \
+    --name "My Chess Server"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now rchess
+sudo journalctl -u rchess -f
+```
+
+---
+
+## Admin Dashboard
+
+Open in browser: `http://server:9002`  (add `?pw=yourpassword` if set)
+
+### Features
+
+| Feature | How |
+|---|---|
+| View all active rooms | Dashboard homepage |
+| Kick a room instantly | ⚡ Kick button — both players disconnected + state cleared |
+| Send message to a room | 📨 Msg button — appears in their chat as server message |
+| Broadcast to all rooms | Broadcast input at top of page |
+| Update MOTD live | MOTD field — no restart needed |
+| Set admin notes | Note field — internal only |
+| Clear persisted rooms | 🗑 button — deletes .room files (doesn't affect live games) |
+| View event log | Bottom of dashboard — last 80 events |
+| REST API | `/api/status` `/api/rooms` `/api/log` |
+
+### REST API
+
+```bash
+BASE=http://server:9002
+
+# Server status
+curl "$BASE/api/status?pw=yourpw"
+
+# List rooms
+curl "$BASE/api/rooms?pw=yourpw"
+
+# Kick a room
+curl -X POST "$BASE/api/rooms/ABCDEF/kick?pw=yourpw"
+
+# Broadcast message
+curl -X POST "$BASE/api/broadcast?pw=yourpw" -d "Server restarting in 5 minutes"
+
+# Send message to specific room
+curl -X POST "$BASE/api/rooms/ABCDEF/message?pw=yourpw" -d "You're playing well!"
+
+# Update MOTD
+curl -X POST "$BASE/api/motd?pw=yourpw" -d "Server maintenance tonight at 22:00"
+```
+
+---
+
+## Firewall / Port Forwarding
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 9001 | TCP | Game traffic (must be open to clients) |
+| 9002 | TCP | Admin dashboard (keep private or firewall) |
+
+```bash
+# UFW (Ubuntu)
+sudo ufw allow 9001/tcp
+# Only allow admin from your IP:
+sudo ufw allow from YOUR_IP to any port 9002
+
+# Or use an SSH tunnel for admin (safest):
+ssh -L 9002:localhost:9002 user@server
+# Then open http://localhost:9002
+```
+
+---
+
+## Server Config File Reference
+
+`~/.config/rchess/server.toml`
+
+```toml
+# Network
+host             = "0.0.0.0"    # bind address
+port             = 9001          # game TCP port
+admin_port       = 9002          # admin dashboard port
+
+# Public address embedded in invite links
+# Leave empty for auto-detect (LAN IP for local, set for internet)
+public_host      = "chess.example.com"
+
+# Security (leave empty = no password)
+server_password  = ""            # required by all clients
+admin_password   = "secret123"   # admin panel
+
+# Limits
+max_rooms        = 200
+max_conns_per_ip = 20            # per minute
+room_ttl_mins    = 120           # room kept N minutes after both disconnect
+
+# Data
+data_dir         = "./rchess_data"
+
+# Identity
+server_name      = "My Chess Server"
+motd             = "Good luck and have fun!"
+```
+
+---
+
+## Self-Hosting vs Default Server
+
+Players can either:
+
+1. **Use the default server** (configured in the TUI's Online → Settings)
+2. **Host their own** — run `rchess-server`, share the `rc1:…` invite link
+
+If you don't want to rely on any server, just run locally:
+
+```bash
+# Terminal 1:
+./rchess-server
+
+# Terminal 2 (you):
+./rchess
+# Online → Create Room → copy the rc1:… link
+
+# Share the rc1:… link with friend over any channel (chat, email, etc.)
+# Friend pastes it in: Online → Join → paste link → Enter
+```
+
+The room stays alive for 2 hours (default TTL) after both players disconnect,
+so you can reconnect if your connection drops.
+
+---
+
+## Troubleshooting
+
+**"Cannot connect"**
+- Check firewall: `nc -zv server 9001`
+- Make sure server is running: `ps aux | grep rchess-server`
+- Try `--host 0.0.0.0` explicitly
+
+**"Room not found"**
+- Room may have expired (default 2h after both disconnect)
+- Create a new room
+
+**Invite link doesn't work**
+- Make sure `--public` matches the address clients can reach
+- For LAN: server auto-detects LAN IP — check with `ip addr`
+- For internet: set `public_host = "your.domain.com"` in config
+
+**Admin panel shows no rooms**
+- Rooms update every 5s — wait a moment
+- Rooms only appear when players connect, not from disk
+
+**Performance**
+- The server uses Tokio async — handles 1000s of concurrent rooms on a small VPS
+- Each room uses ~2 goroutines + a few KB RAM
+- 1GB RAM handles ~10,000 concurrent rooms comfortably

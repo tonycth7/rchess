@@ -1,300 +1,311 @@
-// src/puzzle.rs — Lichess daily puzzle via curl subprocess
+// src/puzzle.rs — Lichess puzzle fetch via embedded Python script
 //
-// Fetches: https://lichess.org/api/puzzle/daily
-// Uses curl (always available on Arch) — no Rust TLS dependency needed.
-// This avoids the ring/rustls assembly linking issues in makepkg.
+// Uses python3 (always on Arch/Linux) — no pip, no external deps.
+// Includes a pure-Python chess board for FEN reconstruction without python-chess.
 
-use crate::engine::{Board, Castle, Color, Kind, Mv, legal, apply, start_board, game_status, Status};
+use crate::engine::{Board, Castle, Color, Kind};
 
 #[derive(Debug, Clone)]
 pub struct Puzzle {
-    pub id:          String,
-    pub fen:         String,
-    pub moves:       Vec<String>,   // UCI solution moves (all moves incl. opponent setup)
-    pub rating:      u32,
-    pub themes:      Vec<String>,
-    /// Which move index the HUMAN must play (moves[solution_start] is the first human move)
+    pub id:             String,
+    pub fen:            String,
+    pub moves:          Vec<String>,
+    pub rating:         u32,
+    pub themes:         Vec<String>,
     pub solution_start: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PuzzleState {
-    /// Fetching from Lichess
     Loading,
-    /// Failed to fetch
     Failed(String),
-    /// Playing the opponent setup moves automatically
     Setup,
-    /// Waiting for human to move
     WaitingInput,
-    /// Human played correct move, show next opponent move
     CorrectMove,
-    /// Human played wrong move
     WrongMove(String),
-    /// Puzzle solved!
     Solved,
 }
 
-pub fn fetch_daily_puzzle(token: &str) -> Result<Puzzle, String> {
-    use std::process::Command;
+// ── Embedded Python script ────────────────────────────────────────────────────
+// argv: token  theme  rmin  rmax
+// Outputs key=value lines then "OK", or "ERROR:message"
 
-    let url = "https://lichess.org/api/puzzle/daily";
-    rlog!("[rchess/puzzle] fetching via curl: {}", url);
+const FETCH_SCRIPT: &str = r#"
+import sys, json, urllib.request, urllib.error, re
 
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "--silent",
-        "--fail",
-        "--max-time", "15",
-        "--header", "Accept: application/json",
-        "--header", "User-Agent: rchess/0.7.3 (terminal chess)",
-    ]);
+token    = sys.argv[1] if len(sys.argv) > 1 else ""
+theme    = sys.argv[2] if len(sys.argv) > 2 else ""
+rmin_s   = sys.argv[3] if len(sys.argv) > 3 else "0"
+rmax_s   = sys.argv[4] if len(sys.argv) > 4 else "9999"
+rmin = int(rmin_s) if rmin_s.isdigit() else 0
+rmax = int(rmax_s) if rmax_s.isdigit() else 9999
 
-    if !token.is_empty() {
-        cmd.args(["--header", &format!("Authorization: Bearer {}", token)]);
-        rlog!("[rchess/puzzle] using API token");
+headers = {"Accept": "application/json", "User-Agent": "rchess/0.7.3"}
+if token:
+    headers["Authorization"] = "Bearer " + token
+
+# ── Pure-Python chess board for FEN reconstruction ────────────────────────────
+INIT_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+
+def fen_to_state(fen):
+    parts = fen.split()
+    board = []
+    for r in parts[0].split('/'):
+        row = []
+        for c in r:
+            row.extend(['.'] * int(c)) if c.isdigit() else row.append(c)
+        board.append(row)
+    turn   = parts[1]
+    castle = parts[2] if len(parts) > 2 else 'KQkq'
+    ep     = parts[3] if len(parts) > 3 else '-'
+    half   = int(parts[4]) if len(parts) > 4 else 0
+    full   = int(parts[5]) if len(parts) > 5 else 1
+    return [board, turn, castle, ep, half, full]
+
+def state_to_fen(s):
+    board, turn, castle, ep, half, full = s
+    rows = []
+    for row in board:
+        out = ''; empty = 0
+        for c in row:
+            if c == '.': empty += 1
+            else:
+                if empty: out += str(empty); empty = 0
+                out += c
+        if empty: out += str(empty)
+        rows.append(out)
+    return '/'.join(rows) + ' ' + turn + ' ' + (castle or '-') + ' ' + ep + ' ' + str(half) + ' ' + str(full)
+
+def to_sq(name):   return (8 - int(name[1]), ord(name[0]) - ord('a'))
+def sq_nm(r, c):   return chr(ord('a') + c) + str(8 - r)
+def iw(p):         return p != '.' and p.isupper()
+def ib(p):         return p != '.' and p.islower()
+
+def can_slide(b, fr, fc, tr, tc, sr, sc):
+    r, c = fr + sr, fc + sc
+    while (r, c) != (tr, tc):
+        if not (0 <= r < 8 and 0 <= c < 8): return False
+        if b[r][c] != '.': return False
+        r += sr; c += sc
+    return True
+
+def can_move(b, fr, fc, tr, tc, w, ep):
+    p = b[fr][fc]; pt = p.upper()
+    d = b[tr][tc]
+    if w and iw(d): return False
+    if not w and ib(d): return False
+    dr, dc = tr-fr, tc-fc
+    if pt == 'P':
+        fwd = -1 if w else 1; sr = 6 if w else 1
+        if dc == 0:
+            if dr == fwd and d == '.': return True
+            if dr == 2*fwd and fr == sr and d == '.' and b[fr+fwd][fc] == '.': return True
+        elif abs(dc) == 1 and dr == fwd:
+            if (w and ib(d)) or (not w and iw(d)): return True
+            if ep != '-' and to_sq(ep) == (tr, tc): return True
+        return False
+    if pt == 'N': return (abs(dr), abs(dc)) in [(2,1),(1,2)]
+    if pt == 'K': return abs(dr) <= 1 and abs(dc) <= 1
+    if pt in ('B','Q') and abs(dr)==abs(dc) and dr:
+        return can_slide(b, fr, fc, tr, tc, 1 if dr>0 else -1, 1 if dc>0 else -1)
+    if pt in ('R','Q') and (dr==0 or dc==0):
+        return can_slide(b, fr, fc, tr, tc, 0 if dr==0 else (1 if dr>0 else -1), 0 if dc==0 else (1 if dc>0 else -1))
+    return False
+
+def find_pt(b, pt, w):
+    t = pt.upper() if w else pt.lower()
+    return [(r,c) for r in range(8) for c in range(8) if b[r][c]==t]
+
+def apply_san(state, san):
+    board, turn, castle, ep, half, full = state
+    b = [row[:] for row in board]; w = (turn=='w')
+    nep = '-'; nhalf = half+1
+    clean = re.sub(r'[+#!?]+$', '', san)
+    if clean in ('O-O','0-0'):
+        r = 7 if w else 0
+        b[r][4]='.'; b[r][5]='R' if w else 'r'
+        b[r][6]='K' if w else 'k'; b[r][7]='.'
+        nc = castle.replace('K' if w else 'k','').replace('Q' if w else 'q','') or '-'
+        return [b,'b' if w else 'w',nc,'-',nhalf,full+(0 if w else 1)]
+    if clean in ('O-O-O','0-0-0'):
+        r = 7 if w else 0
+        b[r][4]='.'; b[r][0]='.'
+        b[r][2]='K' if w else 'k'; b[r][3]='R' if w else 'r'
+        nc = castle.replace('K' if w else 'k','').replace('Q' if w else 'q','') or '-'
+        return [b,'b' if w else 'w',nc,'-',nhalf,full+(0 if w else 1)]
+    promo = None
+    if '=' in clean: promo=clean[-1]; clean=clean[:-2]
+    pt = clean[0] if (clean[0].isupper() and clean[0]!='x') else 'P'
+    rest = (clean[1:] if pt!='P' else clean).replace('x','')
+    tr, tc = to_sq(rest[-2:]); dis = rest[:-2]
+    cands = [(r,c) for r,c in find_pt(b,pt,w) if can_move(b,r,c,tr,tc,w,ep)]
+    if dis:
+        if dis[0].isalpha(): cands=[x for x in cands if x[1]==ord(dis[0])-ord('a')]
+        if dis[0].isdigit(): cands=[x for x in cands if x[0]==8-int(dis[0])]
+        if len(dis)==2: cands=[x for x in cands if x==(8-int(dis[1]),ord(dis[0])-ord('a'))]
+    if not cands: raise ValueError("No piece for " + san)
+    fr,fc = cands[0]; cap=b[tr][tc]
+    if pt=='P' and ep!='-' and to_sq(ep)==(tr,tc): b[fr][tc]='.'
+    piece=b[fr][fc]; b[fr][fc]='.'
+    b[tr][tc]=(promo.upper() if w else promo.lower()) if promo else piece
+    if pt=='P' and abs(tr-fr)==2: nep=sq_nm((fr+tr)//2,fc)
+    if pt=='P' or cap!='.': nhalf=0
+    nc=castle
+    if pt=='K': nc=nc.replace('K' if w else 'k','').replace('Q' if w else 'q','')
+    if pt=='R':
+        if w:
+            if (fr,fc)==(7,7): nc=nc.replace('K','')
+            if (fr,fc)==(7,0): nc=nc.replace('Q','')
+        else:
+            if (fr,fc)==(0,7): nc=nc.replace('k','')
+            if (fr,fc)==(0,0): nc=nc.replace('q','')
+    nc=nc or '-'
+    return [b,'b' if w else 'w',nc,nep,nhalf,full+(0 if w else 1)]
+
+def fen_from_pgn(pgn_str, ply):
+    state = fen_to_state(INIT_FEN)
+    count = 0
+    for tok in pgn_str.split():
+        if count >= ply: break
+        if re.match(r'^\d+\.+$', tok) or tok in ('1-0','0-1','1/2-1/2','*'): continue
+        state = apply_san(state, tok)
+        count += 1
+    return state_to_fen(state)
+
+# ── Fetch puzzle from Lichess ─────────────────────────────────────────────────
+
+data = None
+if theme:
+    url = "https://lichess.org/api/puzzle/next?angle=" + theme
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            print("ERROR:HTTP " + str(e.code) + ": " + str(e.reason), flush=True)
+            sys.exit(1)
+    except urllib.error.URLError as e:
+        print("ERROR:Network error: " + str(e.reason), flush=True)
+        sys.exit(1)
+
+if not data:
+    url = "https://lichess.org/api/puzzle/daily"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.URLError as e:
+        print("ERROR:Network: " + str(e.reason), flush=True)
+        sys.exit(1)
+    except Exception as e:
+        print("ERROR:" + str(e), flush=True)
+        sys.exit(1)
+
+puzzle = data.get("puzzle", {})
+game   = data.get("game", {})
+pid      = puzzle.get("id", "?")
+rating   = puzzle.get("rating", 1500)
+solution = puzzle.get("solution", [])
+themes   = puzzle.get("themes", [])
+ply      = puzzle.get("initialPly", 0)
+pgn_str  = game.get("pgn", "")
+
+if not solution:
+    print("ERROR:No solution moves in response", flush=True)
+    sys.exit(1)
+
+fen = puzzle.get("fen") or puzzle.get("initialFen") or game.get("fen") or ""
+
+if not fen and pgn_str and ply > 0:
+    try:
+        fen = fen_from_pgn(pgn_str, ply)
+    except Exception as e:
+        print("ERROR:PGN replay failed at ply " + str(ply) + ": " + str(e), flush=True)
+        sys.exit(1)
+
+if not fen:
+    print("ERROR:Could not determine puzzle position (id=" + pid + ", ply=" + str(ply) + ")", flush=True)
+    sys.exit(1)
+
+print("id=" + pid, flush=True)
+print("rating=" + str(rating), flush=True)
+print("fen=" + fen, flush=True)
+print("moves=" + ' '.join(solution), flush=True)
+print("themes=" + ' '.join(themes), flush=True)
+print("OK", flush=True)
+"#;
+
+// ── Fetch function ────────────────────────────────────────────────────────────
+
+pub fn fetch_puzzle(token: &str, theme: &str, _rating_min: u32, _rating_max: u32) -> Result<Puzzle, String> {
+    use std::process::{Command, Stdio};
+    use std::io::Write;
+
+    rlog!("[puzzle] fetching via python3 theme={}", theme);
+
+    let mut child = Command::new("python3")
+        .arg("-")
+        .arg(token)
+        .arg(theme)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("python3 not found: {e}"))?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        let _ = stdin.write_all(FETCH_SCRIPT.as_bytes());
     }
-    cmd.arg(url);
 
-    let output = cmd.output()
-        .map_err(|e| format!("curl not found: {} — install with: sudo pacman -S curl", e))?;
+    let output = child.wait_with_output()
+        .map_err(|e| format!("python3 error: {e}"))?;
 
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        return Err(format!("curl failed (exit {}). Check internet / token.", code));
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    rlog!("[puzzle] stdout: {}", stdout.trim());
+    if !stderr.is_empty() { rlog!("[puzzle] stderr: {}", stderr.trim()); }
+
+    for line in stdout.lines() {
+        if let Some(msg) = line.strip_prefix("ERROR:") {
+            return Err(msg.trim().to_string());
+        }
+    }
+    if !stdout.contains("OK") {
+        return Err(format!("Unexpected output: {}", stdout.chars().take(120).collect::<String>()));
     }
 
-    let body = String::from_utf8(output.stdout)
-        .map_err(|_| "curl returned non-UTF8 data".to_string())?;
+    let mut id = "?".to_string(); let mut fen = String::new();
+    let mut moves = vec![]; let mut rating = 1500u32; let mut themes = vec![];
 
-    rlog!("[rchess/puzzle] curl OK, body length: {}", body.len());
-    parse_puzzle_json(&body)
-}
-
-// Lichess daily puzzle JSON structure (2024):
-// {
-//   "game": { "pgn": "e4 e5 ..." },
-//   "puzzle": {
-//     "id": "abc12",
-//     "rating": 1482,
-//     "solution": ["e2e4","e7e5",...],   <- JSON ARRAY not a string
-//     "themes": ["fork","middlegame",...] <- JSON ARRAY
-//   },
-//   "user": null
-// }
-// The FEN is in "game" -> look for "fen": or reconstruct from "initialFen".
-// Note: the puzzle FEN field may be at root or inside "puzzle" object.
-fn parse_puzzle_json(json: &str) -> Result<Puzzle, String> {
-    rlog!("[rchess/puzzle] raw JSON first 400: {}", &json[..json.len().min(400)]);
-
-    let puzzle_obj = find_str_after(json, "puzzle").unwrap_or_default();
-    let game_obj   = find_str_after(json, "game").unwrap_or_default();
-
-    // Puzzle ID
-    let id = extract_str_val(&puzzle_obj, "id")
-        .unwrap_or_else(|| "?".to_string());
-
-    // Rating
-    let rating = extract_num_val(&puzzle_obj, "rating").unwrap_or(1500);
-
-    // Solution: UCI moves array in puzzle.solution
-    let moves = extract_json_str_array(&puzzle_obj, "solution")
-        .or_else(|| extract_json_str_array(json, "solution"))
-        .or_else(|| extract_str_val(json, "moves")
-            .map(|s| s.split_whitespace().map(|m| m.to_string()).collect()))
-        .unwrap_or_default();
-
-    // Themes
-    let themes = extract_json_str_array(&puzzle_obj, "themes")
-        .unwrap_or_default();
-
-    // initialPly: how many half-moves into the game the puzzle starts
-    let initial_ply = extract_num_val(&puzzle_obj, "initialPly")
-        .unwrap_or(0) as usize;
-
-    // FEN: Lichess does NOT provide a fen field — we must replay game.pgn
-    // up to initialPly half-moves to reach the puzzle start position.
-    // Fallback: try direct fen fields anyway for forward-compat.
-    let fen = extract_str_val(&puzzle_obj, "fen")
-        .or_else(|| extract_str_val(&puzzle_obj, "initialFen"))
-        .or_else(|| extract_str_val(&game_obj, "fen"))
-        .or_else(|| extract_str_val(json, "fen"))
-        .or_else(|| {
-            // Primary path: replay game.pgn up to initialPly
-            let pgn = extract_str_val(&game_obj, "pgn")?;
-            rlog!("[rchess/puzzle] replaying pgn ({} chars) to ply {}", pgn.len(), initial_ply);
-            fen_after_san_ply(&pgn, initial_ply)
-        })
-        .unwrap_or_default();
-
-    rlog!("[rchess/puzzle] id={} rating={} ply={} fen_len={} moves={} themes={}",
-        id, rating, initial_ply, fen.len(), moves.len(), themes.len());
-
-    if fen.is_empty() {
-        // Helpful error showing top-level keys
-        let top_keys: Vec<&str> = json.split('"')
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 1)
-            .map(|(_, s)| s)
-            .filter(|s| !s.is_empty() && !s.contains('{') && !s.contains('}'))
-            .take(10)
-            .collect();
-        return Err(format!("Could not determine puzzle position. Top keys: {}",
-            top_keys.join(", ")));
-    }
-    if moves.is_empty() {
-        return Err("No solution moves in puzzle response".to_string());
+    for line in stdout.lines() {
+        if let Some(v) = line.strip_prefix("id=")     { id     = v.trim().to_string(); }
+        if let Some(v) = line.strip_prefix("fen=")    { fen    = v.trim().to_string(); }
+        if let Some(v) = line.strip_prefix("rating=") { rating = v.trim().parse().unwrap_or(1500); }
+        if let Some(v) = line.strip_prefix("moves=")  { moves  = v.split_whitespace().map(|s| s.to_string()).collect(); }
+        if let Some(v) = line.strip_prefix("themes=") { themes = v.split_whitespace().map(|s| s.to_string()).collect(); }
     }
 
-    rlog!("[rchess/puzzle] success — fen={}", &fen[..fen.len().min(60)]);
+    if fen.is_empty()   { return Err("FEN missing from response".into()); }
+    if moves.is_empty() { return Err("Moves missing from response".into()); }
+
+    rlog!("[puzzle] ok id={} rating={} moves={}", id, rating, moves.len());
     Ok(Puzzle { id, fen, moves, rating, themes, solution_start: 1 })
 }
 
-/// Replay SAN moves (space-separated, as Lichess PGN field) up to `ply` half-moves.
-/// Returns the FEN of the resulting position, or None on parse error.
-fn fen_after_san_ply(pgn_moves: &str, ply: usize) -> Option<String> {
-    use crate::engine::{start_board, apply, legal, Color, Castle};
-
-    let mut board = start_board();
-    let mut color = Color::White;
-    let mut ep:   Option<(usize,usize)> = None;
-    let mut cast  = Castle::all();
-    let mut count = 0usize;
-
-    for token in pgn_moves.split_whitespace() {
-        if count >= ply { break; }
-        // Skip move numbers like "1." "12."
-        if token.ends_with('.') || token.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-            continue;
-        }
-        // Strip result tokens
-        if matches!(token, "1-0" | "0-1" | "1/2-1/2" | "*") { break; }
-
-        let san = token.trim_end_matches(['+', '#', '!', '?'].as_ref());
-        match crate::app::parse_notation(&board, color, ep, &cast, san) {
-            Ok(mv) => {
-                let (nb, ne, nc) = apply(&board, &mv, ep, &cast);
-                board = nb; ep = ne; cast = nc;
-                color = color.opp();
-                count += 1;
-            }
-            Err(e) => {
-                rlog!("[rchess/puzzle] san parse failed '{}' at ply {}: {}", san, count, e);
-                return None;
-            }
-        }
-    }
-
-    Some(board_to_fen(&board, color, ep, &cast))
+pub fn fetch_daily_puzzle(token: &str) -> Result<Puzzle, String> {
+    fetch_puzzle(token, "", 0, 9999)
 }
 
-/// Encode board state as a FEN string.
-fn board_to_fen(
-    board: &crate::engine::Board,
-    color: crate::engine::Color,
-    ep:    Option<(usize,usize)>,
-    cast:  &crate::engine::Castle,
-) -> String {
-    use crate::engine::{Color as C, Kind};
-    let mut ranks = vec![];
-    for r in 0..8 {
-        let mut rank = String::new();
-        let mut empty = 0u8;
-        for c in 0..8 {
-            match board[r][c] {
-                None => empty += 1,
-                Some(p) => {
-                    if empty > 0 { rank.push((b'0' + empty) as char); empty = 0; }
-                    let ch = match p.k {
-                        Kind::K => 'k', Kind::Q => 'q', Kind::R => 'r',
-                        Kind::B => 'b', Kind::N => 'n', Kind::P => 'p',
-                    };
-                    rank.push(if p.c == C::White { ch.to_ascii_uppercase() } else { ch });
-                }
-            }
-        }
-        if empty > 0 { rank.push((b'0' + empty) as char); }
-        ranks.push(rank);
-    }
+// ── FEN parser ────────────────────────────────────────────────────────────────
 
-    let turn    = if color == C::White { "w" } else { "b" };
-    let mut cas = String::new();
-    if cast.wk { cas.push('K'); }
-    if cast.wq { cas.push('Q'); }
-    if cast.bk { cas.push('k'); }
-    if cast.bq { cas.push('q'); }
-    if cas.is_empty() { cas.push('-'); }
-
-    let ep_str = match ep {
-        None        => "-".to_string(),
-        Some((r,c)) => format!("{}{}", (b'a' + c as u8) as char, 8 - r),
-    };
-
-    format!("{} {} {} {} 0 1", ranks.join("/"), turn, cas, ep_str)
-}
-
-/// Get the substring starting from just after the first occurrence of `"key":{`
-fn find_str_after(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":", key);
-    let start  = json.find(&needle)? + needle.len();
-    let rest   = json[start..].trim_start();
-    if rest.starts_with('{') {
-        // Find matching closing brace
-        let mut depth = 0usize;
-        let mut end   = 0usize;
-        for (i, ch) in rest.char_indices() {
-            match ch { '{' => depth += 1, '}' => { depth -= 1; if depth == 0 { end = i; break; } } _ => {} }
-        }
-        Some(rest[..=end].to_string())
-    } else {
-        Some(rest.to_string())
-    }
-}
-
-/// Extract a plain string value: "key":"value"
-fn extract_str_val(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":\"", key);
-    let start  = json.find(&needle)? + needle.len();
-    let end    = json[start..].find('"')? + start;
-    let val    = json[start..end].to_string();
-    if val.is_empty() { None } else { Some(val) }
-}
-
-/// Extract a number value: "key":1234
-fn extract_num_val(json: &str, key: &str) -> Option<u32> {
-    let needle = format!("\"{}\":", key);
-    let start  = json.find(&needle)? + needle.len();
-    let rest   = json[start..].trim_start();
-    let end    = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    if end == 0 { return None; }
-    rest[..end].parse().ok()
-}
-
-/// Extract a JSON string array: "key":["val1","val2",...]
-fn extract_json_str_array(json: &str, key: &str) -> Option<Vec<String>> {
-    let needle = format!("\"{}\":[", key);
-    let start  = json.find(&needle)? + needle.len();
-    let rest   = &json[start..];
-    // Find closing ]
-    let end = rest.find(']').unwrap_or(rest.len());
-    let inner = &rest[..end];
-    let items: Vec<String> = inner.split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if items.is_empty() { None } else { Some(items) }
-}
-
-/// Parse a FEN string into board state.
-/// Returns (board, turn, ep, castling, fullmove) or an error string.
 pub fn parse_fen(fen: &str) -> Result<(Board, Color, Option<(usize,usize)>, Castle, u32), String> {
     let parts: Vec<&str> = fen.split_whitespace().collect();
-    if parts.len() < 2 { return Err("FEN too short".to_string()); }
-
+    if parts.len() < 2 { return Err("FEN too short".into()); }
     let mut board: Board = [[None; 8]; 8];
     let ranks: Vec<&str> = parts[0].split('/').collect();
-    if ranks.len() != 8 { return Err("FEN must have 8 ranks".to_string()); }
-
+    if ranks.len() != 8 { return Err("FEN must have 8 ranks".into()); }
     for (r, rank) in ranks.iter().enumerate() {
         let mut c = 0usize;
         for ch in rank.chars() {
@@ -304,35 +315,30 @@ pub fn parse_fen(fen: &str) -> Result<(Board, Color, Option<(usize,usize)>, Cast
                 use crate::engine::{Piece, Color as PC};
                 let color = if ch.is_uppercase() { PC::White } else { PC::Black };
                 let kind  = match ch.to_ascii_lowercase() {
-                    'k' => Kind::K, 'q' => Kind::Q, 'r' => Kind::R,
-                    'b' => Kind::B, 'n' => Kind::N, 'p' => Kind::P,
-                    x   => return Err(format!("Unknown piece '{}'", x)),
+                    'k'=>Kind::K,'q'=>Kind::Q,'r'=>Kind::R,
+                    'b'=>Kind::B,'n'=>Kind::N,'p'=>Kind::P,
+                    x => return Err(format!("Unknown piece '{x}'")),
                 };
-                if c >= 8 { return Err("FEN rank overflow".to_string()); }
+                if c >= 8 { return Err("FEN rank overflow".into()); }
                 board[r][c] = Some(Piece { c: color, k: kind });
                 c += 1;
             }
         }
     }
-
     let turn = match parts[1] { "w" => Color::White, _ => Color::Black };
-
     let cast_str = parts.get(2).unwrap_or(&"-");
     let cast = Castle {
         wk: cast_str.contains('K'), wq: cast_str.contains('Q'),
         bk: cast_str.contains('k'), bq: cast_str.contains('q'),
     };
-
     let ep = parts.get(3).and_then(|s| {
         if *s == "-" { return None; }
         let b = s.as_bytes();
         if b.len() < 2 { return None; }
-        let c = (b[0] - b'a') as usize;
-        let r = (8 - (b[1] - b'0')) as usize;
-        Some((r, c))
+        let col = (b[0].wrapping_sub(b'a')) as usize;
+        let row = 8usize.checked_sub((b[1] - b'0') as usize)?;
+        if col < 8 && row < 8 { Some((row, col)) } else { None }
     });
-
     let fullmove = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
-
     Ok((board, turn, ep, cast, fullmove))
 }

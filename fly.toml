@@ -1,0 +1,41 @@
+# fly.toml — RChess Server on Fly.io
+# Deploy: fly launch (first time) or fly deploy
+
+app = "rchess-server"     # change to your app name
+primary_region = "iad"    # change to nearest region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Set your public hostname for invite links
+  # RCHESS_PUBLIC_HOST = "rchess-server.fly.dev"
+
+[[services]]
+  protocol    = "tcp"
+  internal_port = 9001
+
+  [[services.ports]]
+    port = 9001
+    handlers = ["tls", "http"]  # remove "tls" for plain TCP
+
+  [services.concurrency]
+    type       = "connections"
+    hard_limit = 500
+    soft_limit = 400
+
+[[services]]
+  protocol      = "tcp"
+  internal_port = 9002
+
+  [[services.ports]]
+    port = 9002
+
+[mounts]
+  source      = "rchess_data"
+  destination = "/app/rchess_data"
+
+[[vm]]
+  memory      = "256mb"
+  cpu_kind    = "shared"
+  cpus        = 1

@@ -1,9 +1,9 @@
 [package]
 name        = "rchess"
-version     = "0.7.3"
+version     = "0.8.0"
 edition     = "2021"
 authors     = ["RChess TUI"]
-description = "Terminal chess — v0.8 with puzzles, PGN import, FEN import, analysis, mouse"
+description = "Terminal chess — multiplayer, puzzles, PGN, analysis, mouse"
 
 [[bin]]
 name = "rchess"
@@ -11,11 +11,15 @@ path = "src/main.rs"
 
 [[bin]]
 name = "rchess-server"
-path = "src/server.rs"
+path = "server/main.rs"
 
 [dependencies]
+# TUI client deps
 ratatui   = "0.29"
 crossterm = "0.28"
+
+# Server deps (Tokio async runtime)
+tokio = { version = "1", features = ["full"] }
 
 [lints.rust]
 dead_code = "warn"

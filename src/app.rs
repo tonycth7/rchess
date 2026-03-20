@@ -25,6 +25,11 @@ pub enum Screen {
     PgnSaved,      // PGN save confirmation popup
     OnlineSetup,   // Enter server address + create/join room
     OnlineWaiting, // Waiting for opponent to connect
+    OnlineLobby,   // Pre-game rule configuration (creator only)
+    UndoOffer,     // Opponent requested an undo
+    ServerPanel,   // Connection info + chat + status overlay
+    OnlineAuth,    // Server password entry
+    PuzzlePicker,  // Choose puzzle theme/rating
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -215,27 +220,66 @@ pub struct App {
     pub puzzle_state:    crate::puzzle::PuzzleState,
     pub puzzle_move_idx: usize,
     pub puzzle_rx:       Option<std::sync::mpsc::Receiver<Result<crate::puzzle::Puzzle, String>>>,
+    // Puzzle picker
+    pub puzzle_pick_cur:  usize,   // cursor on puzzle picker screen
+    pub puzzle_theme:     String,  // selected theme (empty = daily)
+    pub puzzle_rating_min: u32,
+    pub puzzle_rating_max: u32,
     // ── Online multiplayer ────────────────────────────────────────────────────
-    pub net_client:       Option<crate::network::NetClient>,
-    /// Color assigned by the server ("white" / "black").
-    pub online_color:     Option<crate::engine::Color>,
-    /// Room code (6 chars) for sharing with friend.
-    pub online_room_code: String,
-    /// Current sub-step on the OnlineSetup screen.
-    pub online_step:      OnlineStep,
-    /// Text buffer typed by user on setup screen.
-    pub online_buf:       String,
-    /// Feedback message shown on setup / waiting screen.
-    pub online_msg:       String,
-    /// Ping counter for keep-alive.
-    pub online_ping_tick: u32,
+    pub net_client:           Option<crate::network::NetClient>,
+    pub online_color:         Option<crate::engine::Color>,
+    pub online_room_code:     String,
+    pub online_step:          OnlineStep,
+    pub online_buf:           String,
+    pub online_msg:           String,
+    pub online_ping_tick:     u32,
+    /// Room rules (set in lobby before game / received from server on join/rejoin)
+    pub online_opts:          crate::network::RoomOptions,
+    /// Cursor row in the OnlineLobby rule-configuration screen
+    pub lobby_cur:            usize,
+    /// Cached: whether a rejoinable session file exists
+    pub has_session:          bool,
+    /// Cached session display info (code, color)
+    pub session_display:      Option<(String, String)>,
+    /// Stashed server address (online_buf gets reused for room code)
+    pub online_server_addr:   String,
+    /// Action to fire after AUTH_OK (so create/join never races with auth)
+    pub pending_net_action:   Option<PendingNetAction>,
+    /// Whether the opponent is currently connected
+    pub online_opp_connected: bool,
+    /// True while we've sent an undo request and are waiting for reply
+    pub undo_offer_pending:   bool,
+    /// Rejoin token (issued by server on CREATE/JOIN, stored for next session)
+    pub online_token:         String,
+    /// Server info received on connect
+    pub server_info:          crate::network::ServerInfo,
+    /// Ping RTT in milliseconds (None = not yet measured)
+    pub ping_ms:              Option<u64>,
+    /// Server password (entered in OnlineAuth screen)
+    pub server_pw_buf:        String,
+    /// Invite link (rc1:…) received from server after room creation
+    pub online_invite_link:   String,
+    /// Opponent display name (sent by server when they set NAME)
+    pub online_opp_name:      String,
+    /// Self-contained chat module state
+    pub chat: crate::chat::ChatState,
+    /// Local server child process (when user launches server from UI)
+    pub local_server_pid:     Option<u32>,
+}
+
+/// Action queued to fire after server AUTH_OK.
+#[derive(Clone, Debug)]
+pub enum PendingNetAction {
+    Create,
+    Join(String),   // room code
+    Rejoin(String, String, String),  // code, color, token
 }
 
 /// Sub-steps on the OnlineSetup screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OnlineStep {
     EnterAddr,    // typing server address
-    ChooseAction, // Create or Join?
+    ChooseAction, // Create / Join / Rejoin?
     EnterRoom,    // typing room code (join path)
     Connecting,   // waiting for server response
 }
@@ -273,6 +317,10 @@ impl App {
             puzzle_state: crate::puzzle::PuzzleState::Loading,
             puzzle_move_idx: 0,
             puzzle_rx: None,
+            puzzle_pick_cur: 0,
+            puzzle_theme: String::new(),
+            puzzle_rating_min: 0,
+            puzzle_rating_max: 9999,
             net_client: None,
             online_color: None,
             online_room_code: String::new(),
@@ -280,6 +328,22 @@ impl App {
             online_buf: String::new(),
             online_msg: String::new(),
             online_ping_tick: 0,
+            online_opts: crate::network::RoomOptions::default(),
+            lobby_cur: 0,
+            online_server_addr: String::new(),
+            online_opp_connected: false,
+            undo_offer_pending: false,
+            has_session: false,
+            session_display: None,
+            pending_net_action: None,
+            online_token: String::new(),
+            server_info: crate::network::ServerInfo::default(),
+            ping_ms: None,
+            server_pw_buf: String::new(),
+            online_invite_link: String::new(),
+            online_opp_name: String::new(),
+            chat: crate::chat::ChatState::new(),
+            local_server_pid: None,
         }
     }
 
@@ -542,6 +606,8 @@ impl App {
 
     fn queue_analysis_after_move(&mut self) {
         if self.cfg.ui_mode == UiMode::Minimal { return; }
+        // Block engine if online rules disallow it during the game
+        if self.mode == Mode::Online && !self.online_opts.engine_during_game { return; }
         let h = &self.gs.history;
         let move_idx    = h.len().saturating_sub(1);
         let color_moved = h.last().map(|e| e.color).unwrap_or(Color::White);
@@ -936,11 +1002,25 @@ impl App {
                 if let Some(ref client) = self.net_client { client.send_draw_offer(); }
                 self.draw_offer_msg = Some("Draw offer sent…".into());
             }
-            // R = resign in online mode
+            // P = open server panel (online mode)
+            KeyCode::Char('P') if self.mode == Mode::Online => {
+                self.screen = Screen::ServerPanel;
+            }
+            // U = request undo (online, if allowed by room rules, not already pending)
+            KeyCode::Char('u') if self.mode == Mode::Online
+                               && self.online_opts.undo_allowed
+                               && !self.undo_offer_pending
+                               && !over => {
+                if let Some(ref client) = self.net_client { client.send_undo_request(); }
+                self.undo_offer_pending = true;
+                self.online_msg = "Undo request sent…".into();
+            }
+            // R (shift) = resign in online mode
             KeyCode::Char('R') if self.mode == Mode::Online && !over => {
                 if let Some(ref client) = self.net_client { client.send_resign(); }
                 self.gs.status = Status::Checkmate;
                 self.draw_offer_msg = Some("You resigned.".into());
+                self.clear_session();
             }
             KeyCode::Up    | KeyCode::Char('k') => { if self.cursor.0 > 0 { self.cursor.0 -= 1; } }
             KeyCode::Down  | KeyCode::Char('j') => { if self.cursor.0 < 7 { self.cursor.0 += 1; } }
@@ -963,6 +1043,7 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 if self.mode == Mode::Online {
                     if let Some(ref client) = self.net_client { client.send_draw_accept(); }
+                    self.clear_session();
                 }
                 self.gs.status = Status::Stalemate;
                 self.game_end  = GameEnd::Draw;
@@ -1178,6 +1259,14 @@ impl App {
                     client.send_move(&uci);
                 }
             }
+            // Apply time increment after each move
+            if self.online_opts.increment_secs > 0 {
+                let inc_ms = self.online_opts.increment_secs as u64 * 1000;
+                match piece.c {
+                    Color::White => { if let Some(ref mut ms) = self.gs.white_ms { *ms += inc_ms; } }
+                    Color::Black => { if let Some(ref mut ms) = self.gs.black_ms { *ms += inc_ms; } }
+                }
+            }
         }
 
         let move_time_ms = self.last_tick.elapsed().as_millis() as u64;
@@ -1337,104 +1426,295 @@ impl App {
 
     // ── Online multiplayer ────────────────────────────────────────────────────
 
+    // ── Online multiplayer ────────────────────────────────────────────────────
+
+    // ── Session persistence (for rejoin after disconnect) ─────────────────────
+    fn session_path() -> Option<std::path::PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        Some(std::path::PathBuf::from(home).join(".config").join("rchess").join("online_session.txt"))
+    }
+
+    pub fn save_session(&mut self) {
+        if let Some(path) = Self::session_path() {
+            if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+            let content = format!("server={}\ncode={}\ncolor={}\ntoken={}\n",
+                self.online_server_addr,
+                self.online_room_code,
+                self.online_color.map(|c| c.name().to_lowercase()).unwrap_or_default(),
+                self.online_token);
+            let _ = std::fs::write(path, content);
+        }
+        self.has_session = true;
+        self.session_display = Some((
+            self.online_room_code.clone(),
+            self.online_color.map(|c| c.name().to_lowercase()).unwrap_or_default(),
+        ));
+    }
+
+    pub fn load_session(&self) -> Option<(String, String, String, String)> {
+        let content = std::fs::read_to_string(Self::session_path()?).ok()?;
+        let mut server = String::new(); let mut code = String::new();
+        let mut color  = String::new(); let mut token = String::new();
+        for line in content.lines() {
+            let mut kv = line.splitn(2, '=');
+            let k = kv.next().unwrap_or("").trim();
+            let v = kv.next().unwrap_or("").trim();
+            match k {
+                "server" => server = v.to_string(),
+                "code"   => code   = v.to_string(),
+                "color"  => color  = v.to_string(),
+                "token"  => token  = v.to_string(),
+                _ => {}
+            }
+        }
+        if !server.is_empty() && !code.is_empty() && !color.is_empty() {
+            Some((server, code, color, token))
+        } else { None }
+    }
+
+    fn clear_session(&mut self) {
+        if let Some(path) = Self::session_path() { let _ = std::fs::remove_file(path); }
+        self.has_session = false;
+        self.session_display = None;
+    }
+
+    // ── Open online screen ────────────────────────────────────────────────────
+
     pub fn open_online(&mut self) {
-        self.mode         = Mode::Online;
-        self.online_step  = OnlineStep::EnterAddr;
-        self.online_buf   = "127.0.0.1:9001".to_string();
-        self.online_msg   = String::new();
-        self.online_room_code = String::new();
-        self.online_color     = None;
+        self.mode        = Mode::Online;
+        self.online_step = OnlineStep::EnterAddr;
+        // Load session once and cache it
+        if let Some((server, code, color, _)) = self.load_session() {
+            self.has_session     = true;
+            self.session_display = Some((code, color));
+            self.online_buf      = server;
+        } else {
+            self.has_session     = false;
+            self.session_display = None;
+            self.online_buf      = "127.0.0.1:9001".to_string();
+        }
+        self.online_msg          = String::new();
+        self.online_room_code    = String::new();
+        self.online_color        = None;
+        self.online_opp_connected = false;
+        self.undo_offer_pending  = false;
+        self.chat.clear();
+        self.ping_ms             = None;
+        self.online_invite_link  = String::new();
+        self.online_opp_name     = String::new();
         if let Some(ref mut c) = self.net_client { c.disconnect(); }
         self.net_client = None;
         self.screen = Screen::OnlineSetup;
     }
 
+    // ── Setup screen key handler ──────────────────────────────────────────────
+
     pub fn handle_online_setup_key(&mut self, code: KeyCode) {
         use crate::network::NetClient;
         match self.online_step {
-            // ── Typing server address ─────────────────────────────────────────
+
+            // ── Step 1: type server address ───────────────────────────────────
             OnlineStep::EnterAddr => match code {
                 KeyCode::Esc => { self.screen = Screen::Menu; self.mode = Mode::PvP; }
                 KeyCode::Enter => {
-                    self.online_msg   = String::new();
-                    self.online_step  = OnlineStep::ChooseAction;
+                    // Warn if user entered the admin port instead of the game port
+                    let addr = self.online_buf.trim().to_string();
+                    if addr.ends_with(":9002") || addr.ends_with(":8080") || addr.ends_with(":80") {
+                        self.online_msg = format!(
+                            "⚠ Port {} is the admin/HTTP port. Use :9001 for the game.",
+                            addr.split(':').last().unwrap_or("?"));
+                        return;
+                    }
+                    self.online_msg = String::new();
+                    self.online_server_addr = addr;
+                    self.online_step = OnlineStep::ChooseAction;
                 }
                 KeyCode::Backspace => { self.online_buf.pop(); }
                 KeyCode::Char(c)   => { self.online_buf.push(c); }
                 _ => {}
             },
-            // ── Create or Join ────────────────────────────────────────────────
+
+            // ── Step 2: Create / Join / Rejoin ────────────────────────────────
             OnlineStep::ChooseAction => match code {
                 KeyCode::Esc => { self.online_step = OnlineStep::EnterAddr; }
-                // 'C' → Create room
+
+                // [C] Create — go to lobby rule picker first
                 KeyCode::Char('c') | KeyCode::Char('C') => {
-                    let addr = self.online_buf.clone();
-                    self.online_room_code = addr.clone(); // stash addr
-                    match NetClient::connect(&addr) {
-                        Ok(client) => {
-                            client.send_create();
-                            self.net_client  = Some(client);
-                            self.online_step = OnlineStep::Connecting;
-                            self.online_msg  = "Creating room…".into();
-                            self.screen      = Screen::OnlineWaiting;
-                        }
-                        Err(e) => { self.online_msg = format!("Error: {e}"); }
-                    }
+                    self.online_server_addr = self.online_buf.clone();
+                    self.online_opts = crate::network::RoomOptions::default();
+                    self.lobby_cur   = 0;
+                    self.screen      = Screen::OnlineLobby;
                 }
-                // 'J' → Join room (ask for code)
+
+                // [J] Join — ask for room code
                 KeyCode::Char('j') | KeyCode::Char('J') => {
-                    self.online_room_code = self.online_buf.clone(); // stash server addr
+                    self.online_server_addr = self.online_buf.clone();
                     self.online_buf  = String::new();
                     self.online_step = OnlineStep::EnterRoom;
                     self.online_msg  = String::new();
                 }
+
+                // [L] Launch a local server then auto-connect
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.launch_local_server();
+                }
+                // [X] Clear saved session
+                KeyCode::Char('x') | KeyCode::Char('X') => {
+                    self.clear_session();
+                    self.has_session     = false;
+                    self.session_display = None;
+                    self.online_msg      = "Session cleared.".into();
+                }
+
+                // [R] Rejoin last session
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if let Some((_, saved_code, color, token)) = self.load_session() {
+                        let addr = self.online_server_addr.clone();
+                        match NetClient::connect(&addr) {
+                            Ok(client) => {
+                                if !self.server_pw_buf.is_empty() {
+                                    client.send_auth(&self.server_pw_buf);
+                                    self.pending_net_action = Some(PendingNetAction::Rejoin(saved_code.clone(), color.clone(), token.clone()));
+                                } else {
+                                    client.send_rejoin(&saved_code, &color, &token);
+                                }
+                                self.net_client       = Some(client);
+                                self.online_room_code = saved_code.clone();
+                                self.online_step      = OnlineStep::Connecting;
+                                self.online_msg       = format!("Rejoining room {}…", saved_code);
+                                self.screen           = Screen::OnlineWaiting;
+                            }
+                            Err(e) => { self.online_msg = format!("Rejoin failed: {e}"); }
+                        }
+                    } else {
+                        self.online_msg = "No saved session found.".into();
+                    }
+                }
                 _ => {}
             },
-            // ── Typing room code to join ──────────────────────────────────────
+
+            // ── Step 3: type room code OR paste invite link ──────────────────
             OnlineStep::EnterRoom => match code {
-                KeyCode::Esc => {
-                    self.online_step = OnlineStep::ChooseAction;
-                    self.online_buf  = String::new();
-                }
+                KeyCode::Esc => { self.online_step = OnlineStep::ChooseAction; self.online_buf = String::new(); }
                 KeyCode::Enter => {
-                    let addr = {
-                        // addr was saved in online_msg temporarily; re-derive from original
-                        // The address is still in online_buf from EnterAddr, so let's
-                        // store it properly. We stored addr in online_msg during ChooseAction.
-                        // Actually let's recover from net_client not existing — addr was online_buf.
-                        // We reset online_buf for room code entry, so we need addr stored elsewhere.
-                        // Use online_room_code as a temporary addr stash.
-                        self.online_room_code.clone()
+                    let raw = self.online_buf.trim().to_string();
+                    if raw.is_empty() { self.online_msg = "Enter a room code or invite link.".into(); return; }
+
+                    // Auto-detect invite link (rc1:…)
+                    let (addr, room) = if raw.starts_with("rc1:") {
+                        match crate::network::decode_invite(&raw) {
+                            Some((h, p, code)) => {
+                                let a = format!("{}:{}", h, p);
+                                (a, code)
+                            }
+                            None => {
+                                self.online_msg = "Invalid invite link format.".into();
+                                return;
+                            }
+                        }
+                    } else {
+                        (self.online_server_addr.clone(), raw.to_uppercase())
                     };
-                    let code = self.online_buf.trim().to_uppercase();
-                    if code.is_empty() { self.online_msg = "Enter a room code.".into(); return; }
+
+                    if room.is_empty() { self.online_msg = "Enter a room code.".into(); return; }
+
                     match NetClient::connect(&addr) {
                         Ok(client) => {
-                            client.send_join(&code);
-                            self.net_client  = Some(client);
-                            self.online_step = OnlineStep::Connecting;
-                            self.online_msg  = format!("Joining room {code}…");
-                            self.screen      = Screen::OnlineWaiting;
+                            if !self.server_pw_buf.is_empty() {
+                                client.send_auth(&self.server_pw_buf);
+                                self.pending_net_action = Some(PendingNetAction::Join(room.clone()));
+                            } else {
+                                client.send_join(&room);
+                            }
+                            // Update server addr if decoded from link
+                            self.online_server_addr = addr;
+                            self.net_client         = Some(client);
+                            self.online_step        = OnlineStep::Connecting;
+                            self.online_msg         = format!("Joining room {}…", room);
+                            self.screen             = Screen::OnlineWaiting;
                         }
                         Err(e) => { self.online_msg = format!("Error: {e}"); }
                     }
                 }
                 KeyCode::Backspace => { self.online_buf.pop(); }
-                KeyCode::Char(c) if self.online_buf.len() < 8 => {
-                    self.online_buf.push(c.to_ascii_uppercase());
+                KeyCode::Char(c) if self.online_buf.len() < 60 => {
+                    // Allow lowercase for invite links
+                    self.online_buf.push(c);
                 }
                 _ => {}
             },
+
             OnlineStep::Connecting => {
                 if code == KeyCode::Esc {
                     if let Some(ref mut c) = self.net_client { c.disconnect(); }
-                    self.net_client = None;
-                    self.screen     = Screen::OnlineSetup;
+                    self.net_client  = None;
+                    self.screen      = Screen::OnlineSetup;
                     self.online_step = OnlineStep::ChooseAction;
                 }
             }
         }
     }
+
+    // ── Lobby (rule picker, creator only) ─────────────────────────────────────
+
+    pub fn handle_online_lobby_key(&mut self, code: KeyCode) {
+        use crate::network::NetClient;
+        const TIME_OPTS: &[u32] = &[0, 60, 180, 300, 600, 900, 1800];
+        const INC_OPTS:  &[u32] = &[0, 2, 5, 10, 30];
+        const ROWS: usize = 4;
+        match code {
+            KeyCode::Esc => { self.screen = Screen::OnlineSetup; self.online_step = OnlineStep::ChooseAction; }
+            KeyCode::Up   | KeyCode::Char('k') => { if self.lobby_cur > 0 { self.lobby_cur -= 1; } }
+            KeyCode::Down | KeyCode::Char('j') => { if self.lobby_cur < ROWS - 1 { self.lobby_cur += 1; } }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
+                let fwd = matches!(code, KeyCode::Right | KeyCode::Char('l'));
+                match self.lobby_cur {
+                    0 => {
+                        let i = TIME_OPTS.iter().position(|&x| x == self.online_opts.time_secs).unwrap_or(4);
+                        self.online_opts.time_secs = if fwd { TIME_OPTS[(i+1)%TIME_OPTS.len()] }
+                            else { TIME_OPTS[(i+TIME_OPTS.len()-1)%TIME_OPTS.len()] };
+                    }
+                    1 => {
+                        let i = INC_OPTS.iter().position(|&x| x == self.online_opts.increment_secs).unwrap_or(0);
+                        self.online_opts.increment_secs = if fwd { INC_OPTS[(i+1)%INC_OPTS.len()] }
+                            else { INC_OPTS[(i+INC_OPTS.len()-1)%INC_OPTS.len()] };
+                    }
+                    2 => { self.online_opts.undo_allowed       = !self.online_opts.undo_allowed; }
+                    3 => { self.online_opts.engine_during_game = !self.online_opts.engine_during_game; }
+                    _ => {}
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let addr = self.online_server_addr.clone();
+                if addr.is_empty() {
+                    self.online_msg = "No server address set — go back and enter one.".into();
+                    return;
+                }
+                match NetClient::connect(&addr) {
+                    Ok(client) => {
+                        if !self.server_pw_buf.is_empty() {
+                            // Auth required — queue create to fire after AUTH_OK
+                            client.send_auth(&self.server_pw_buf);
+                            self.pending_net_action = Some(PendingNetAction::Create);
+                        } else {
+                            // No auth — send create immediately
+                            client.send_create(&self.online_opts);
+                        }
+                        self.net_client  = Some(client);
+                        self.online_step = OnlineStep::Connecting;
+                        self.online_msg  = format!("Connecting to {}…", addr);
+                        self.screen      = Screen::OnlineWaiting;
+                    }
+                    Err(e) => {
+                        self.online_msg = format!("Cannot connect to {addr}: {e}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Waiting screen key handler ─────────────────────────────────────────────
 
     pub fn handle_online_waiting_key(&mut self, code: KeyCode) {
         if code == KeyCode::Esc || code == KeyCode::Char('q') {
@@ -1445,12 +1725,39 @@ impl App {
         }
     }
 
-    /// Called every tick from main loop.  Drains inbound network messages.
+    // ── Undo offer screen ─────────────────────────────────────────────────────
+
+    pub fn handle_undo_offer_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(ref client) = self.net_client { client.send_undo_accept(); }
+                // Roll back 2 half-moves (opponent's request + their last move)
+                let pops = self.undo_stack.len().min(2);
+                let mut snap = None;
+                for _ in 0..pops { snap = self.undo_stack.pop(); }
+                if let Some((gs, cr, cc)) = snap {
+                    self.gs = gs; self.cursor = (cr, cc);
+                    self.selected = None; self.targets = vec![];
+                    self.move_reviews.truncate(self.gs.history.len());
+                }
+                self.screen = Screen::Game;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                if let Some(ref client) = self.net_client { client.send_undo_decline(); }
+                self.screen = Screen::Game;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Network tick ──────────────────────────────────────────────────────────
+
     pub fn poll_network(&mut self) {
         use crate::network::NetMsg;
 
         // Keep-alive ping every ~5 s (100 ticks × 50 ms)
         if self.net_client.is_some() {
+            self.chat.tick();
             self.online_ping_tick += 1;
             if self.online_ping_tick >= 100 {
                 self.online_ping_tick = 0;
@@ -1465,82 +1772,449 @@ impl App {
 
         for msg in msgs {
             match msg {
+
                 // ── Room created — show code, wait for opponent ───────────────
                 NetMsg::RoomCreated(code) => {
                     self.online_room_code = code.clone();
-                    self.online_msg = format!("Share code: {}  — waiting for friend…", code);
-                    self.screen     = Screen::OnlineWaiting;
+                    self.online_msg       = String::new(); // waiting screen shows code prominently
+                    self.screen           = Screen::OnlineWaiting;
+                    // Save session NOW so rejoin works even if opponent never connects
+                    self.save_session();
                 }
+
+                // ── Received room options (joiner / rejoiner) ─────────────────
+                NetMsg::Lobby(opts) => {
+                    self.online_opts = opts;
+                }
+
                 // ── Joined a room — got colour ────────────────────────────────
                 NetMsg::Joined { color } => {
                     self.online_color = Some(if color == "white" { Color::White } else { Color::Black });
                     self.player_color = self.online_color.unwrap();
-                    self.online_msg   = format!("You are {}. Waiting for game to start…", color);
+                    self.online_msg   = String::new();
+                    // Joiner saves session after getting color assigned
+                    self.save_session();
                 }
-                // ── Both players present — start game ─────────────────────────
+
+                // ── Both present — start fresh game ───────────────────────────
                 NetMsg::Start => {
                     self.start_game();
-                    self.screen = Screen::Game;
+                    // Apply agreed time control
+                    if self.online_opts.time_secs == 0 {
+                        self.gs.white_ms = None;
+                        self.gs.black_ms = None;
+                    } else {
+                        let ms = self.online_opts.time_secs as u64 * 1000;
+                        self.gs.white_ms = Some(ms);
+                        self.gs.black_ms = Some(ms);
+                    }
+                    self.online_opp_connected = true;
+                    self.save_session();
+                    self.online_msg = String::new();
+                    self.screen     = Screen::Game;
+                }
+
+                // ── Rejoined in-progress game ─────────────────────────────────
+                NetMsg::Reconnected { color, moves } => {
+                    self.online_color = Some(if color == "white" { Color::White } else { Color::Black });
+                    self.player_color = self.online_color.unwrap();
+                    self.start_game();
+                    // Apply time control from opts (received in Lobby msg before this)
+                    if self.online_opts.time_secs > 0 {
+                        let ms = self.online_opts.time_secs as u64 * 1000;
+                        self.gs.white_ms = Some(ms);
+                        self.gs.black_ms = Some(ms);
+                    } else {
+                        self.gs.white_ms = None;
+                        self.gs.black_ms = None;
+                    }
+                    // Silently replay move history to restore board state
+                    for uci in &moves {
+                        let clean = uci.trim_end_matches(['+','#']);
+                        if let Ok(mv) = parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, clean) {
+                            // Apply without triggering AI or analysis
+                            let (nb, ne, nc) = crate::engine::apply(&self.gs.board, &mv, self.gs.ep, &self.gs.cast);
+                            let next  = self.gs.turn.opp();
+                            let new_s = crate::engine::game_status(&nb, next, ne, &nc);
+                            self.gs.board = nb; self.gs.turn = next;
+                            self.gs.ep = ne; self.gs.cast = nc; self.gs.status = new_s;
+                            if next == Color::White { self.gs.fullmove += 1; }
+                        }
+                    }
+                    self.online_opp_connected = true;
+                    self.online_msg = String::new();
+                    self.screen     = Screen::Game;
+                }
+
+                // ── Opponent temporarily disconnected ─────────────────────────
+                NetMsg::OpponentDisconnected => {
+                    self.online_opp_connected = false;
+                    self.online_msg = "Opponent disconnected — waiting for reconnect (Esc to quit)…".into();
+                }
+
+                // ── Opponent came back ────────────────────────────────────────
+                NetMsg::OpponentReconnected => {
+                    self.online_opp_connected = true;
                     self.online_msg = String::new();
                 }
+
                 // ── Opponent moved ────────────────────────────────────────────
                 NetMsg::OpponentMove(uci) => {
                     if self.screen == Screen::Game {
-                        if let Ok(mv) = parse_notation(
-                            &self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, &uci
-                        ) {
+                        let clean = uci.trim_end_matches(['+','#']).to_string();
+                        if let Ok(mv) = parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, &clean) {
                             self.execute(mv);
                         } else {
                             rlog!("[online] bad move from opponent: {}", uci);
                         }
                     }
                 }
-                // ── Draw offers ───────────────────────────────────────────────
+
+                // ── Draw offer/result ─────────────────────────────────────────
                 NetMsg::DrawOffer => {
                     self.draw_offer     = Some(self.gs.turn);
                     self.draw_offer_msg = Some("Opponent offers a draw".into());
                     self.screen         = Screen::DrawOffer;
                 }
                 NetMsg::DrawAccepted => {
-                    self.gs.status    = Status::Stalemate; // reuse Stalemate for draw display
+                    self.gs.status      = Status::Stalemate;
+                    self.game_end       = GameEnd::Draw;
                     self.draw_offer_msg = Some("Draw accepted".into());
+                    self.clear_session();
                 }
                 NetMsg::DrawDeclined => {
                     self.draw_offer     = None;
-                    self.draw_offer_msg = Some("Draw declined".into());
+                    self.draw_offer_msg = Some("Draw declined.".into());
                     self.screen         = Screen::Game;
                 }
+
+                // ── Undo protocol ─────────────────────────────────────────────
+                NetMsg::UndoRequest => {
+                    self.screen = Screen::UndoOffer;
+                }
+                NetMsg::UndoAccepted => {
+                    self.undo_offer_pending = false;
+                    // Roll back our last 2 half-moves (ours + opponent's)
+                    let pops  = self.undo_stack.len().min(2);
+                    let mut snap = None;
+                    for _ in 0..pops { snap = self.undo_stack.pop(); }
+                    if let Some((gs, cr, cc)) = snap {
+                        self.gs = gs; self.cursor = (cr, cc);
+                        self.selected = None; self.targets = vec![];
+                        self.move_reviews.truncate(self.gs.history.len());
+                    }
+                    self.online_msg = String::new();
+                }
+                NetMsg::UndoDeclined => {
+                    self.undo_offer_pending = false;
+                    self.online_msg = "Undo request declined.".into();
+                }
+
                 // ── Opponent resigned ─────────────────────────────────────────
                 NetMsg::OpponentResigned => {
-                    self.gs.status = Status::Checkmate; // reuse Checkmate screen
+                    self.gs.status      = Status::Checkmate;
                     self.draw_offer_msg = Some("Opponent resigned — you win!".into());
+                    self.clear_session();
                 }
-                // ── Disconnected ──────────────────────────────────────────────
+
+                // ── Connection lost ───────────────────────────────────────────
                 NetMsg::Disconnected => {
-                    self.online_msg = "Opponent disconnected.".into();
-                    self.net_client = None;
+                    self.online_msg          = "Connection lost.".into();
+                    self.net_client          = None;
+                    self.pending_net_action  = None;
                 }
-                NetMsg::Error(e) => {
-                    self.online_msg = format!("Server error: {e}");
+
+                NetMsg::Error(e) => { self.online_msg = format!("⚠ {e}"); }
+                NetMsg::Pong { rtt_ms } => { self.ping_ms = Some(rtt_ms); }
+                NetMsg::AuthOk => {
+                    // Fire any queued action that was waiting for auth
+                    match self.pending_net_action.take() {
+                        Some(PendingNetAction::Create) => {
+                            let opts = self.online_opts.clone();
+                            if let Some(ref c) = self.net_client { c.send_create(&opts); }
+                            self.online_msg = "Authenticated — creating room…".into();
+                        }
+                        Some(PendingNetAction::Join(room)) => {
+                            if let Some(ref c) = self.net_client { c.send_join(&room); }
+                            self.online_msg = format!("Authenticated — joining {}…", room);
+                        }
+                        Some(PendingNetAction::Rejoin(code, color, token)) => {
+                            if let Some(ref c) = self.net_client { c.send_rejoin(&code, &color, &token); }
+                            self.online_msg = format!("Authenticated — rejoining {}…", code);
+                        }
+                        None => {
+                            if self.online_room_code.is_empty() {
+                                self.online_msg = "Authenticated ✓".into();
+                            }
+                        }
+                    }
                 }
-                NetMsg::Pong => {}
+                NetMsg::AuthFailed(e) => {
+                    self.online_msg = format!("Auth failed: {e}");
+                    self.screen = Screen::OnlineAuth;
+                }
+                NetMsg::Motd(msg) => {
+                    if !msg.is_empty() {
+                        self.chat.push_server(format!("📢 {}", msg));
+                    }
+                }
+                NetMsg::ServerInfo(info) => { self.server_info = info; }
+                NetMsg::Token(tok)       => { self.online_token = tok; }
+
+                NetMsg::InviteLink(link) => {
+                    self.online_invite_link = link;
+                }
+
+                NetMsg::OppName(name) => {
+                    self.online_opp_name = name.clone();
+                    self.chat.opp_name   = name;
+                }
+
+                NetMsg::NameAck(_) => { /* name confirmed */ }
+
+                NetMsg::ServerMsg(msg) => {
+                    self.chat.push_server(format!("📢 {}", msg));
+                    self.online_msg = format!("📢 Server: {}", &msg[..msg.len().min(60)]);
+                }
+
+                NetMsg::Kicked(reason) => {
+                    self.chat.push_server(format!("⚡ Kicked: {}", reason));
+                    self.online_msg         = format!("⚡ Disconnected by admin: {}", reason);
+                    self.online_opp_name    = String::new();
+                    self.online_invite_link = String::new();
+                    self.online_room_code   = String::new();
+                    self.online_token       = String::new();
+                    self.online_color       = None;
+                    self.net_client         = None;
+                    self.clear_session();
+                    self.screen             = Screen::OnlineSetup;
+                }
+
+                NetMsg::Chat { color, msg } => {
+                    // Server now echoes our own messages back too, so distinguish by color
+                    let my_color_str = match self.online_color {
+                        Some(Color::White) => "white",
+                        Some(Color::Black) => "black",
+                        None               => "",
+                    };
+                    let plaintext = crate::chat::decrypt(&msg, &self.online_room_code)
+                        .unwrap_or(msg);
+                    if color == my_color_str {
+                        self.chat.push_me(plaintext);
+                    } else {
+                        self.chat.push_opponent(plaintext);
+                    }
+                }
+
+                NetMsg::ChatHistory { color, msg } => {
+                    use crate::chat::Sender;
+                    let my_color_str = match self.online_color {
+                        Some(Color::White) => "white",
+                        Some(Color::Black) => "black",
+                        None               => "",
+                    };
+                    let plaintext = crate::chat::decrypt(&msg, &self.online_room_code)
+                        .unwrap_or(msg);
+                    let sender = if color == my_color_str { Sender::Me } else { Sender::Opponent };
+                    self.chat.push_history(sender, plaintext);
+                }
+
+                NetMsg::Clock { white_ms, black_ms } => {
+                    // Sync clocks from opponent (authoritative on their side)
+                    if let Some(ref _c) = self.net_client {
+                        // Only accept clock from opponent when it's their turn
+                        let my_color = self.online_color.unwrap_or(Color::White);
+                        if self.gs.turn == my_color {
+                            // It's our turn so we don't update from opponent's clock send
+                        } else {
+                            if white_ms > 0 { self.gs.white_ms = Some(white_ms); }
+                            if black_ms > 0 { self.gs.black_ms = Some(black_ms); }
+                        }
+                    }
+                }
+
+                NetMsg::PingReq => {
+                    // Server pinging us to confirm we're alive
+                    if let Some(ref c) = self.net_client { c.send_pong(); }
+                }
             }
         }
     }
 
+    // ── Auth screen (password entry) ──────────────────────────────────────────
+    pub fn handle_online_auth_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                if let Some(ref mut c) = self.net_client { c.disconnect(); }
+                self.net_client = None;
+                self.screen = Screen::OnlineSetup;
+            }
+            KeyCode::Enter => {
+                let pw = self.server_pw_buf.clone();
+                if let Some(ref c) = self.net_client { c.send_auth(&pw); }
+                self.online_msg = "Authenticating…".into();
+                self.screen = Screen::OnlineWaiting;
+                self.server_pw_buf.clear();
+            }
+            KeyCode::Backspace => { self.server_pw_buf.pop(); }
+            KeyCode::Char(c)   => { self.server_pw_buf.push(c); }
+            _ => {}
+        }
+    }
+
+    // ── Server panel (overlay over game or waiting) ────────────────────────────
+    pub fn handle_server_panel_key(&mut self, code: KeyCode) {
+        use crate::chat::ChatKeyResult;
+        // Global Esc / P closes panel when chat is not focused
+        if !self.chat.focused {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('p') | KeyCode::Char('P')) {
+                self.screen = Screen::Game;
+                return;
+            }
+        }
+        match self.chat.handle_key(code) {
+            ChatKeyResult::Send(plaintext) => {
+                // Encrypt and transmit — server will echo it back as CHAT:mycolor:HEX
+                // so we do NOT push locally here (avoids duplicate messages)
+                let enc = crate::chat::encrypt(&plaintext, &self.online_room_code);
+                if let Some(ref c) = self.net_client { c.send_chat(&enc); }
+            }
+            ChatKeyResult::Opened | ChatKeyResult::Closed | ChatKeyResult::None => {}
+        }
+    }
+
+    // ── Launch local server ────────────────────────────────────────────────────
+    pub fn launch_local_server(&mut self) {
+        if let Some(pid) = self.local_server_pid {
+            self.online_server_addr = "127.0.0.1:9001".into();
+            self.online_buf         = "127.0.0.1:9001".into();
+            self.online_step        = OnlineStep::ChooseAction;
+            self.online_msg = format!("Server already running (PID {pid}) — press C to create or J to join");
+            return;
+        }
+        let exe_dir = std::env::current_exe().ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let server_bin = exe_dir
+            .map(|d| d.join("rchess-server"))
+            .unwrap_or_else(|| std::path::PathBuf::from("rchess-server"));
+
+        use std::process::Stdio;
+        match std::process::Command::new(&server_bin)
+            .arg("--host").arg("127.0.0.1")
+            .arg("--port").arg("9001")
+            .arg("--admin").arg("9002")
+            .arg("--data").arg("./rchess_data")
+            .arg("--fresh")           // wipe old rooms on each local start
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                let pid = child.id();
+                self.local_server_pid   = Some(pid);
+                self.online_server_addr = "127.0.0.1:9001".into();
+                self.online_buf         = "127.0.0.1:9001".into();
+                // Small delay before connecting — server needs ~200ms to bind port
+                // We use a tick-based approach: set a flag and connect on next tick
+                self.online_step        = OnlineStep::ChooseAction;
+                self.online_msg         = format!("✓ Server started (PID {pid}) — press C to create a room, J to join");
+                // Clear any stale session since we just wiped server state
+                self.clear_session();
+            }
+            Err(e) => {
+                self.online_msg = format!("Failed to start server: {e} — is rchess-server in the same directory?");
+            }
+        }
+    }
+
+
     // ── Puzzle ────────────────────────────────────────────────────────────────
+    pub fn handle_puzzle_picker_key(&mut self, code: KeyCode) {
+        const THEMES: &[(&str, &str)] = &[
+            ("",               "★  Daily Puzzle  (Lichess pick of the day)"),
+            ("opening",        "♟  Opening"),
+            ("middlegame",     "⚔  Middlegame"),
+            ("endgame",        "♔  Endgame"),
+            ("fork",           "⑂  Fork"),
+            ("pin",            "📌  Pin"),
+            ("skewer",         "↔  Skewer"),
+            ("discoveredAttack","💥  Discovered Attack"),
+            ("sacrifice",      "🎁  Sacrifice"),
+            ("mateIn1",        "⚡  Mate in 1"),
+            ("mateIn2",        "⚡  Mate in 2"),
+            ("mateIn3",        "⚡  Mate in 3"),
+            ("crushing",       "💪  Crushing"),
+            ("equality",       "⚖  Equality / Defense"),
+        ];
+        const RATING_OPTS: &[(u32,u32,&str)] = &[
+            (0,    9999, "Any rating"),
+            (0,    1200, "Beginner  (< 1200)"),
+            (1200, 1600, "Intermediate  (1200–1600)"),
+            (1600, 2000, "Advanced  (1600–2000)"),
+            (2000, 2400, "Expert  (2000–2400)"),
+            (2400, 9999, "Master  (2400+)"),
+        ];
+        let total = THEMES.len() + RATING_OPTS.len() + 1; // +1 for GO button
+        match code {
+            KeyCode::Esc => { self.screen = Screen::Menu; }
+            KeyCode::Up   | KeyCode::Char('k') => {
+                if self.puzzle_pick_cur > 0 { self.puzzle_pick_cur -= 1; }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.puzzle_pick_cur + 1 < total { self.puzzle_pick_cur += 1; }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let ti = THEMES.len();
+                let ri = ti + RATING_OPTS.len();
+                if self.puzzle_pick_cur < ti {
+                    // Select theme and immediately start
+                    self.puzzle_theme = THEMES[self.puzzle_pick_cur].0.to_string();
+                    self.start_puzzle_fetch();
+                } else if self.puzzle_pick_cur < ri {
+                    // Select rating and immediately start
+                    let (min, max, _) = RATING_OPTS[self.puzzle_pick_cur - ti];
+                    self.puzzle_rating_min = min;
+                    self.puzzle_rating_max = max;
+                    self.start_puzzle_fetch();
+                } else {
+                    // GO button — start with whatever is already selected
+                    self.start_puzzle_fetch();
+                }
+            }
+            // Quick theme cycling with left/right on theme rows
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.puzzle_pick_cur > 0 { self.puzzle_pick_cur -= 1; }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let total = THEMES.len() + RATING_OPTS.len() + 1;
+                if self.puzzle_pick_cur + 1 < total { self.puzzle_pick_cur += 1; }
+            }
+            _ => {}
+        }
+    }
+
+
     pub fn open_puzzle(&mut self) {
+        // Go to picker screen first, not directly into puzzle
+        self.puzzle_pick_cur = 0;
+        self.screen = Screen::PuzzlePicker;
+    }
+
+    pub fn start_puzzle_fetch(&mut self) {
         self.puzzle       = None;
         self.puzzle_state = crate::puzzle::PuzzleState::Loading;
         self.puzzle_move_idx = 0;
         self.screen       = Screen::Puzzle;
 
-        // Fetch in background thread — capture token before move into thread
         let cfg_token = self.cfg.lichess_token.clone();
+        let theme     = self.puzzle_theme.clone();
+        let rmin      = self.puzzle_rating_min;
+        let rmax      = self.puzzle_rating_max;
         let (tx, rx) = std::sync::mpsc::channel();
         self.puzzle_rx = Some(rx);
         std::thread::spawn(move || {
-            let result = crate::puzzle::fetch_daily_puzzle(&cfg_token);
+            let result = crate::puzzle::fetch_puzzle(&cfg_token, &theme, rmin, rmax);
             let _ = tx.send(result);
         });
     }
@@ -1611,7 +2285,8 @@ impl App {
                 return;
             }
             KeyCode::Char('n') => {
-                self.open_puzzle();
+                self.puzzle_pick_cur = 0;
+                self.screen = Screen::PuzzlePicker;
                 return;
             }
             _ => {}
