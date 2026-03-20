@@ -36,7 +36,10 @@ cd rchess
 cargo build --release
 ./target/release/rchess
 ```
-
+or just 
+```bash
+cargo install --git https://github.com/tonycth7/rchess
+```
 ### Optional dependencies
 
 ```bash
