@@ -206,26 +206,6 @@ Both saved to `~/rchess_export/`:
 
 ---
 
-## Project structure
-
-```
-src/
-├── main.rs        — event loop
-├── log.rs         — silent file logger (/tmp/rchess.log)
-├── engine.rs      — chess rules, move generation
-├── ai.rs          — minimax + alpha-beta + piece-square tables
-├── book.rs        — opening book + ECO name detection
-├── analysis.rs    — background analysis (built-in + Stockfish UCI, MultiPV)
-├── app.rs         — game state, key/mouse handlers
-├── ui.rs          — ratatui rendering (board, panels, overlays)
-├── config.rs      — settings, themes, enums
-├── png_export.rs  — board → PNG via Python Pillow
-├── puzzle.rs      — Lichess daily puzzle API + FEN parser
-└── pgn_import.rs  — PGN file/text parser
-```
-
----
-
 ## Debug log
 
 All internal output goes to `/tmp/rchess.log` — the terminal stays clean.
