@@ -232,14 +232,25 @@ fn stockfish_thread(
     writeln!(w, "isready").ok();
     w.flush().ok();
 
-    // Wait for "readyok"
+    // Wait for "readyok" — log every line during init
     let mut line = String::new();
-    loop {
+    let mut got_ready = false;
+    for _ in 0..200 {  // read at most 200 lines during init (avoids infinite loop)
         line.clear();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 { return; }
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => { rlog!("[rchess/sf] pipe closed during init"); break; }
+            Ok(_) => {}
+        }
         let t = line.trim();
-        rlog!("[rchess/sf] init: {}", t);
-        if t == "readyok" { break; }
+        if t == "readyok" { got_ready = true; break; }
+        if t == "uciok" {
+            // Send isready now that uciok is confirmed
+            writeln!(w, "isready").ok(); w.flush().ok();
+        }
+    }
+    if !got_ready {
+        rlog!("[rchess/sf] never got readyok — analysis Stockfish thread exiting");
+        return;
     }
     rlog!("[rchess/sf] ready");
 

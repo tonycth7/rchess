@@ -131,25 +131,42 @@ impl PieceStyle {
 
 // ── AiDepth ───────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AiDepth { Easy=1, Medium=2, Hard=3, Expert=4 }
+pub enum AiDepth { Easy=1, Medium=2, Hard=3, Expert=4, Stockfish=5 }
 impl AiDepth {
-    pub const ALL: &'static [AiDepth] = &[AiDepth::Easy, AiDepth::Medium, AiDepth::Hard, AiDepth::Expert];
+    pub const ALL: &'static [AiDepth] = &[
+        AiDepth::Easy, AiDepth::Medium, AiDepth::Hard, AiDepth::Expert, AiDepth::Stockfish
+    ];
     pub fn name(self) -> &'static str {
         match self {
-            AiDepth::Easy   => "Easy    (depth 1)",
-            AiDepth::Medium => "Medium  (depth 2)",
-            AiDepth::Hard   => "Hard    (depth 3)",
-            AiDepth::Expert => "Expert  (depth 4, slow)",
+            AiDepth::Easy      => "Easy      (depth 1)",
+            AiDepth::Medium    => "Medium    (depth 2)",
+            AiDepth::Hard      => "Hard      (depth 3)",
+            AiDepth::Expert    => "Expert    (depth 4)",
+            AiDepth::Stockfish => "Stockfish (strongest)",
         }
     }
-    pub fn depth(self) -> u8 { self as u8 }
+    /// Returns minimax depth. Returns 4 for Stockfish (fallback if SF not installed).
+    pub fn depth(self) -> u8 {
+        match self {
+            AiDepth::Easy   => 1,
+            AiDepth::Medium => 2,
+            AiDepth::Hard   => 3,
+            AiDepth::Expert => 4,
+            AiDepth::Stockfish => 4, // fallback depth
+        }
+    }
+    pub fn is_stockfish(self) -> bool { self == AiDepth::Stockfish }
 }
 impl std::str::FromStr for AiDepth {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, ()> {
         Ok(match s {
-            "1" => AiDepth::Easy, "2" => AiDepth::Medium, "4" => AiDepth::Expert,
-            _   => AiDepth::Hard,
+            "1" | "easy"      => AiDepth::Easy,
+            "5" | "stockfish" => AiDepth::Stockfish,
+            "2" | "medium"    => AiDepth::Medium,
+            "4" | "expert"    => AiDepth::Expert,
+            "5" | "stockfish" => AiDepth::Stockfish,
+            _                  => AiDepth::Hard,
         })
     }
 }
@@ -435,7 +452,7 @@ impl Config {
                     PieceStyle::Unicode=>"unicode", PieceStyle::Letters=>"letters",
                     PieceStyle::FatLetters=>"fatletters", PieceStyle::Blocks=>"blocks",
                 },
-                self.ai_depth.depth(),
+                match self.ai_depth { AiDepth::Stockfish => 5, d => d.depth() },
                 match self.move_hints {
                     MoveHints::Dots=>"dots", MoveHints::Highlight=>"highlight",
                     MoveHints::None=>"none",

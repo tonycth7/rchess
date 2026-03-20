@@ -186,6 +186,7 @@ pub struct App {
     // Analysis engine (background, always running)
     pub analysis:     crate::analysis::AnalysisHandle,
     pub engine_busy:  bool,
+    engine_busy_since: Option<std::time::Instant>,  // detects stuck analysis
     /// Queued analysis to fire once engine is free (move_idx, uci_before, uci_after, color)
     pending_analysis: Option<(usize, String, String, crate::engine::Color)>,
     // Move review data
@@ -233,6 +234,7 @@ impl App {
             thinking: false, ai_rx: None,
             analysis,
             engine_busy: false,
+            engine_busy_since: None,
             pending_analysis: None,
             move_reviews: vec![],
             last_eval_cp: 0,
@@ -273,6 +275,7 @@ impl App {
         self.replay_snaps.clear(); self.game_end = GameEnd::Normal;
         self.last_tick = Instant::now();
         self.engine_busy = false;
+        self.engine_busy_since = None;
         self.pending_analysis = None;
         self.move_reviews.clear();
         self.last_eval_cp = 0;
@@ -288,17 +291,54 @@ impl App {
     // ── Built-in CPU AI ───────────────────────────────────────────────────────
     pub fn kick_ai(&mut self) {
         if self.thinking { return; }
-        let (board, color, ep, cast, depth) = (
-            self.gs.board, self.gs.turn, self.gs.ep, self.gs.cast,
-            self.cfg.ai_depth.depth(),
-        );
-        let history = self.gs.history.clone();
-        let (tx, rx) = mpsc::channel();
-        self.thinking = true; self.ai_rx = Some(rx);
+        self.thinking = true;
         self.gs.clock_state = ClockState::Paused;
-        thread::spawn(move || {
-            tx.send(best_mv(&board, color, ep, &cast, depth, &history)).ok();
-        });
+
+        let (tx, rx) = mpsc::channel();
+        self.ai_rx = Some(rx);
+
+        if self.cfg.ai_depth.is_stockfish() {
+            // Stockfish level: spawn a SEPARATE stockfish instance (not the analysis one)
+            // We use a thread with a hard 3s timeout via channel so it never hangs
+            let uci_history: String = self.gs.history.iter()
+                .map(|h| h.notation.trim_end_matches(['+','#']).to_string())
+                .collect::<Vec<_>>().join(" ");
+            let skill = self.cfg.stockfish_skill;
+            let board = self.gs.board;
+            let color = self.gs.turn;
+            let ep    = self.gs.ep;
+            let cast  = self.gs.cast;
+            let history = self.gs.history.clone();
+            thread::spawn(move || {
+                // Inner channel with timeout
+                let (inner_tx, inner_rx) = std::sync::mpsc::channel();
+                let moves_clone = uci_history.clone();
+                std::thread::spawn(move || {
+                    let mv = stockfish_best_move(&moves_clone, skill);
+                    let _ = inner_tx.send(mv);
+                });
+                // Wait max 3 seconds, then fall back to minimax
+                let mv = inner_rx
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        crate::rlog!("[rchess/sf-cpu] timeout — falling back to minimax d4");
+                        best_mv(&board, color, ep, &cast, 4, &history)
+                    });
+                tx.send(mv).ok();
+            });
+        } else {
+            // Use built-in minimax
+            let (board, color, ep, cast, depth) = (
+                self.gs.board, self.gs.turn, self.gs.ep, self.gs.cast,
+                self.cfg.ai_depth.depth(),
+            );
+            let history = self.gs.history.clone();
+            thread::spawn(move || {
+                tx.send(best_mv(&board, color, ep, &cast, depth, &history)).ok();
+            });
+        }
     }
 
     // ── Main 50 ms tick ───────────────────────────────────────────────────────
@@ -337,12 +377,26 @@ impl App {
     }
 
     fn poll_analysis(&mut self) {
+        // Watchdog: if analysis has been busy for >5s with no result, reset it
+        // This handles the case where the Stockfish analysis thread silently dies
+        if self.engine_busy {
+            if let Some(since) = self.engine_busy_since {
+                if since.elapsed().as_secs() > 5 {
+                    rlog!("[rchess/analysis] watchdog: resetting stuck analysis engine");
+                    self.engine_busy = false;
+                    self.engine_busy_since = None;
+                    self.pending_analysis = None;
+                    return;
+                }
+            }
+        }
         if !self.engine_busy { return; }
         let result = match self.analysis.try_recv() {
             Some(r) => r,
             None    => return,
         };
         self.engine_busy = false;
+        self.engine_busy_since = None;
 
         let move_idx = result.move_idx;
         // delta_cp: how much the mover's side changed in White-positive terms
@@ -410,6 +464,7 @@ impl App {
             rlog!("[rchess/analysis] firing pending move {}", mi);
             self.analysis.analyse(mi, &ub, &ua, cm, self.cfg.analysis_depth);
             self.engine_busy = true;
+            self.engine_busy_since = Some(std::time::Instant::now());
         }
     }
 
@@ -437,6 +492,22 @@ impl App {
         }
     }
 
+
+    /// Respawn the analysis engine with current config settings.
+    /// Called when the user changes analysis engine or depth in Settings.
+    pub fn restart_analysis_engine(&mut self) {
+        self.engine_busy = false;
+        self.engine_busy_since = None;
+        self.pending_analysis = None;
+        self.analysis = crate::analysis::AnalysisHandle::spawn(
+            self.cfg.analysis_engine,
+            self.cfg.analysis_depth,
+            self.cfg.stockfish_skill,
+        );
+        rlog!("[rchess] analysis engine restarted: {} d{}",
+            self.analysis.engine_name, self.cfg.analysis_depth);
+    }
+
     fn queue_analysis_after_move(&mut self) {
         if self.cfg.ui_mode == UiMode::Minimal { return; }
         let h = &self.gs.history;
@@ -456,6 +527,7 @@ impl App {
         rlog!("[rchess/analysis] queuing move {} ({:?})", move_idx, color_moved);
         self.analysis.analyse(move_idx, &uci_before, &uci_after, color_moved, self.cfg.analysis_depth);
         self.engine_busy = true;
+        self.engine_busy_since = Some(std::time::Instant::now());
     }
 
     // ── Clock ─────────────────────────────────────────────────────────────────
@@ -554,12 +626,26 @@ impl App {
         let white_name = match self.mode {
             Mode::PvP => "Player 1".to_string(),
             Mode::CPU => if self.player_color == Color::White { "Player".to_string() }
-                         else { format!("CPU ({})", self.cfg.ai_depth.name().split_whitespace().next().unwrap_or("AI")) },
+                         else {
+                             let label = if self.cfg.ai_depth.is_stockfish() {
+                                 format!("CPU (Stockfish sk{})", self.cfg.stockfish_skill)
+                             } else {
+                                 format!("CPU ({})", self.cfg.ai_depth.name().split_whitespace().next().unwrap_or("AI"))
+                             };
+                             label
+                         },
         };
         let black_name = match self.mode {
             Mode::PvP => "Player 2".to_string(),
             Mode::CPU => if self.player_color == Color::Black { "Player".to_string() }
-                         else { format!("CPU ({})", self.cfg.ai_depth.name().split_whitespace().next().unwrap_or("AI")) },
+                         else {
+                             let label = if self.cfg.ai_depth.is_stockfish() {
+                                 format!("CPU (Stockfish sk{})", self.cfg.stockfish_skill)
+                             } else {
+                                 format!("CPU ({})", self.cfg.ai_depth.name().split_whitespace().next().unwrap_or("AI"))
+                             };
+                             label
+                         },
         };
         let tc_str = match self.cfg.time_control {
             TimeControl::Infinite => "-", TimeControl::Bullet => "60",
@@ -726,7 +812,10 @@ impl App {
             8  => self.cfg.auto_flip       = !self.cfg.auto_flip,
             9  => self.cfg.confirm_move    = !self.cfg.confirm_move,
             10 => self.cfg.ui_mode         = cyc(UiMode::ALL,         self.cfg.ui_mode,         fwd),
-            11 => self.cfg.analysis_engine = cyc(AnalysisEngine::ALL, self.cfg.analysis_engine, fwd),
+            11 => {
+                self.cfg.analysis_engine = cyc(AnalysisEngine::ALL, self.cfg.analysis_engine, fwd);
+                self.restart_analysis_engine();
+            }
             13 => self.cfg.auto_save_png   = !self.cfg.auto_save_png,
             14 => {
                 let cur = self.cfg.highlight_brightness as i16;
@@ -734,11 +823,14 @@ impl App {
             }
             15 => self.cfg.cell_w = if fwd { (self.cfg.cell_w + 1).min(20) } else { self.cfg.cell_w.saturating_sub(1).max(4) },
             16 => self.cfg.cell_h = if fwd { (self.cfg.cell_h + 1).min(10) } else { self.cfg.cell_h.saturating_sub(1).max(2) },
-            12 => self.cfg.analysis_depth = if fwd {
-                       (self.cfg.analysis_depth % 3) + 1
-                   } else {
-                       if self.cfg.analysis_depth <= 1 { 3 } else { self.cfg.analysis_depth - 1 }
-                   },
+            12 => {
+                self.cfg.analysis_depth = if fwd {
+                    (self.cfg.analysis_depth % 3) + 1
+                } else {
+                    if self.cfg.analysis_depth <= 1 { 3 } else { self.cfg.analysis_depth - 1 }
+                };
+                self.restart_analysis_engine();
+            }
             _  => {}
         }
     }
@@ -1381,6 +1473,82 @@ impl App {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// ── Stockfish as CPU opponent ─────────────────────────────────────────────────
+/// Spawn Stockfish, send position, get best move. Returns None if SF not installed.
+fn stockfish_best_move(uci_moves: &str, skill: u8) -> Option<crate::engine::Mv> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("stockfish")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().ok()?;
+
+    let stdin  = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let mut w      = std::io::BufWriter::new(stdin);
+    let mut reader = BufReader::new(stdout);
+
+    writeln!(w, "uci").ok();
+    writeln!(w, "setoption name Skill Level value {}", skill.min(20)).ok();
+    writeln!(w, "isready").ok();
+    w.flush().ok();
+
+    // Wait for readyok
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 { break; }
+        if line.trim() == "readyok" { break; }
+    }
+
+    // Send position
+    if uci_moves.trim().is_empty() {
+        writeln!(w, "position startpos").ok();
+    } else {
+        writeln!(w, "position startpos moves {}", uci_moves.trim()).ok();
+    }
+    writeln!(w, "go movetime 300").ok();
+    w.flush().ok();
+
+    // Read until bestmove
+    let mut best_uci: Option<String> = None;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let t = line.trim();
+        if t.starts_with("bestmove") {
+            best_uci = t.split_whitespace().nth(1)
+                .filter(|&s| s != "(none)")
+                .map(|s| s.to_string());
+            break;
+        }
+    }
+    writeln!(w, "quit").ok();
+    let _ = child.wait();
+
+    let uci = best_uci?;
+    crate::rlog!("[rchess/sf-cpu] bestmove: {}", uci);
+
+    let b = uci.as_bytes();
+    if b.len() < 4 { return None; }
+    if !(b[0] >= b'a' && b[0] <= b'h') { return None; }
+    let from = ((b'8' - b[1]) as usize, (b[0] - b'a') as usize);
+    let to   = ((b'8' - b[3]) as usize, (b[2] - b'a') as usize);
+    let promo = b.get(4).and_then(|&p| match p.to_ascii_lowercase() {
+        b'q' => Some(crate::engine::Kind::Q),
+        b'r' => Some(crate::engine::Kind::R),
+        b'b' => Some(crate::engine::Kind::B),
+        b'n' => Some(crate::engine::Kind::N),
+        _    => None,
+    });
+
+    Some(crate::engine::Mv { fr: from, to, promo, ep: false, castle: 0 })
+}
+
 
 /// Expand leading ~ to $HOME in file paths
 fn shellexpand_tilde(path: &str) -> String {
