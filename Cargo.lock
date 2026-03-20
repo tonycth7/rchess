@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "rchess"
-version = "0.8.0"
+version = "0.7.3"
 dependencies = [
  "crossterm",
  "ratatui",
