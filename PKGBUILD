@@ -2,18 +2,18 @@
 pkgname=rchess
 pkgver=0.7.3
 pkgrel=1
-pkgdesc="Terminal chess with AI, analysis, puzzles, PNG/PGN export"
+pkgdesc="Terminal chess with AI, analysis, Lichess puzzles, PNG/PGN export"
 arch=('x86_64' 'aarch64')
 url="https://github.com/tonycth7/rchess"
 license=('MIT')
 depends=(
     'gcc-libs'
+    'curl'        # used for Lichess puzzle API (no Rust TLS deps needed)
 )
 optdepends=(
     'python-pillow: PNG board export (Shift+E in-game)'
     'stockfish: stronger move analysis (enable in Settings)'
     'ttf-freefont: Unicode chess symbols in PNG export'
-    'ca-certificates: HTTPS for Lichess daily puzzle'
 )
 makedepends=('rust' 'cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
@@ -21,12 +21,12 @@ sha256sums=('SKIP')
 
 build() {
     cd "$pkgname-$pkgver"
-    cargo build --release --locked
+    cargo build --release
 }
 
 check() {
     cd "$pkgname-$pkgver"
-    cargo test --release --locked 2>/dev/null || true
+    cargo test --release 2>/dev/null || true
 }
 
 package() {

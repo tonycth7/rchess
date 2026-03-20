@@ -1,7 +1,8 @@
-// src/puzzle.rs — Lichess daily puzzle via HTTP (uses ureq)
+// src/puzzle.rs — Lichess daily puzzle via curl subprocess
 //
 // Fetches: https://lichess.org/api/puzzle/daily
-// Falls back gracefully if network is unavailable.
+// Uses curl (always available on Arch) — no Rust TLS dependency needed.
+// This avoids the ring/rustls assembly linking issues in makepkg.
 
 use crate::engine::{Board, Castle, Color, Kind, Mv, legal, apply, start_board, game_status, Status};
 
@@ -35,20 +36,38 @@ pub enum PuzzleState {
 }
 
 pub fn fetch_daily_puzzle(token: &str) -> Result<Puzzle, String> {
-    let mut req = ureq::get("https://lichess.org/api/puzzle/daily")
-        .set("Accept", "application/json")
-        .set("User-Agent", "rchess/0.7.3 (terminal chess)");
+    use std::process::Command;
+
+    let url = "https://lichess.org/api/puzzle/daily";
+    rlog!("[rchess/puzzle] fetching via curl: {}", url);
+
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "--silent",
+        "--fail",
+        "--max-time", "15",
+        "--header", "Accept: application/json",
+        "--header", "User-Agent: rchess/0.7.3 (terminal chess)",
+    ]);
+
     if !token.is_empty() {
-        req = req.set("Authorization", &format!("Bearer {}", token));
+        cmd.args(["--header", &format!("Authorization: Bearer {}", token)]);
         rlog!("[rchess/puzzle] using API token");
     }
-    let response = req
-        .timeout(std::time::Duration::from_secs(10))
-        .call()
-        .map_err(|e| format!("Network error: {}", e))?;
+    cmd.arg(url);
 
-    let body = response.into_string().map_err(|e| format!("Read error: {}", e))?;
-    rlog!("[rchess/puzzle] HTTP OK, body length: {}", body.len());
+    let output = cmd.output()
+        .map_err(|e| format!("curl not found: {} — install with: sudo pacman -S curl", e))?;
+
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        return Err(format!("curl failed (exit {}). Check internet / token.", code));
+    }
+
+    let body = String::from_utf8(output.stdout)
+        .map_err(|_| "curl returned non-UTF8 data".to_string())?;
+
+    rlog!("[rchess/puzzle] curl OK, body length: {}", body.len());
     parse_puzzle_json(&body)
 }
 

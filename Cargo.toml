@@ -1,6 +1,6 @@
 [package]
 name        = "rchess"
-version     = "0.7.3"
+version     = "0.8.0"
 edition     = "2021"
 authors     = ["RChess TUI"]
 description = "Terminal chess — v0.8 with puzzles, PGN import, FEN import, analysis, mouse"
@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 ratatui   = "0.29"
 crossterm = "0.28"
-ureq      = { version = "2", features = ["json"] }
 
 [lints.rust]
 dead_code = "warn"
