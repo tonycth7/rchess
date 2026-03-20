@@ -230,6 +230,13 @@ Everything saved to `~/rchess_export/`:
 | Standard | 120 × 34 |
 | Analysis | 130 × 40 |
 | Block art pieces | 130 × 40 minimum |
+=======
+| | Version | Notes |
+|-|---------|-------|
+| Rust + Cargo | 1.70+ | [rustup.rs](https://rustup.rs) — build dependency only |
+| Terminal | 115×32+ recommended | Smaller works in Minimal mode |
+| Python + Pillow | any | PNG export only |
+| Stockfish | any | Analysis only |
 
 ---
 
