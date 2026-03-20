@@ -9,6 +9,10 @@ description = "Terminal chess — v0.8 with puzzles, PGN import, FEN import, ana
 name = "rchess"
 path = "src/main.rs"
 
+[[bin]]
+name = "rchess-server"
+path = "src/server.rs"
+
 [dependencies]
 ratatui   = "0.29"
 crossterm = "0.28"

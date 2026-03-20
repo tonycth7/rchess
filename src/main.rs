@@ -13,6 +13,7 @@ mod config;
 mod ui;
 mod png_export;
 mod analysis;
+mod network;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -102,6 +103,8 @@ fn main() -> io::Result<()> {
                         Screen::PgnImport   => app.handle_pgn_import_key(key.code),
                         Screen::Puzzle      => app.handle_puzzle_key(key.code),
                         Screen::PgnSaved    => { app.screen = Screen::Game; }  // any key closes
+                        Screen::OnlineSetup   => app.handle_online_setup_key(key.code),
+                        Screen::OnlineWaiting => app.handle_online_waiting_key(key.code),
                     }
                 }
                 // ── Mouse ─────────────────────────────────────────────────────
@@ -117,6 +120,7 @@ fn main() -> io::Result<()> {
         if last_tick.elapsed() >= tick {
             app.poll_ai();
             app.poll_puzzle();
+            app.poll_network();
             last_tick = Instant::now();
         }
 

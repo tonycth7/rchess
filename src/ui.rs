@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
-use crate::app::{App, Gs, Mode, Screen, ClockState, GameEnd, ReplaySnap, MoveLabel, VERSION};
+use crate::app::{App, Gs, Mode, Screen, ClockState, GameEnd, ReplaySnap, MoveLabel, OnlineStep, VERSION};
 use crate::config::{MoveHints, PieceStyle, Theme, UiMode};
 use crate::engine::{Color as PC, Kind, Status, king_sq};
 
@@ -61,13 +61,15 @@ pub fn render(app: &App, f: &mut Frame) {
         Screen::FenInput    => draw_fen_input(app, f),
         Screen::PgnImport   => draw_pgn_import(app, f),
         Screen::Puzzle      => draw_puzzle(app, f),
+        Screen::OnlineSetup   => draw_online_setup(app, f),
+        Screen::OnlineWaiting => draw_online_waiting(app, f),
     }
 }
 
 // ── MENU ──────────────────────────────────────────────────────────────────────
 fn draw_menu(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
-    let rect = center(58, 28, f.area());
+    let rect = center(58, 30, f.area());
     f.render_widget(
         Block::default().borders(Borders::ALL).border_type(BorderType::Double)
             .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
@@ -77,6 +79,7 @@ fn draw_menu(app: &App, f: &mut Frame) {
     let opts  = [
         "  ♟  TWO PLAYERS",
         "  ◈  VS COMPUTER   [AI + Opening Book]",
+        "  ⚡  ONLINE vs FRIEND  [Real-time]",
         "  ⚙  SETTINGS",
         "  ≡  START FROM FEN",
         "  ↥  LOAD PGN FILE",
@@ -330,8 +333,10 @@ fn draw_game(app: &App, f: &mut Frame) {
 fn draw_topbar(app: &App, f: &mut Frame, area: Rect) {
     let th = app.cfg.theme;
     let mode_s = match app.mode {
-        Mode::PvP => "TWO PLAYERS".to_string(),
-        Mode::CPU  => format!("VS CPU [YOU:{}] [{}]",
+        Mode::PvP    => "TWO PLAYERS".to_string(),
+        Mode::Online => format!("ONLINE  [YOU:{}]",
+            app.online_color.map(|c| c.name()).unwrap_or("?")),
+        Mode::CPU    => format!("VS CPU [YOU:{}] [{}]",
             app.player_color.name(),
             app.cfg.ai_depth.name().split_whitespace().next().unwrap_or("")),
     };
@@ -1898,4 +1903,156 @@ fn draw_puzzle_sidebar(app: &App, f: &mut Frame, area: Rect) {
         Line::from(vec![Span::styled(" Enter/click  select & move", sty(DIM))]),
         Line::from(vec![Span::styled(" n  new puzzle    q  menu", sty(DIM))]),
     ]).block(panel_block("KEYS", th)), keys_area);
+}
+
+// ── ONLINE SETUP ──────────────────────────────────────────────────────────────
+fn draw_online_setup(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let rect = center(60, 22, f.area());
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
+        rect,
+    );
+    let inner = pad(rect, 2, 1);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  ⚡ ONLINE VS FRIEND", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled("  Real-time multiplayer over TCP", sty(DIM))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]),
+        Line::from(""),
+    ];
+
+    match app.online_step {
+        OnlineStep::EnterAddr => {
+            lines.push(Line::from(vec![Span::styled("  SERVER ADDRESS", sty(DIM))]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ▶ ", sty(ac(th))),
+                Span::styled(
+                    format!("{:<50}", &app.online_buf),
+                    Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled("  Default: 127.0.0.1:9001 (local)", sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled("  Use your host's public IP for cross-network play", sty(DIMMER))]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled("  Enter confirm    Esc back to menu", sty(DIMMER))]));
+        }
+        OnlineStep::ChooseAction => {
+            lines.push(Line::from(vec![
+                Span::styled("  Server: ", sty(DIM)),
+                Span::styled(&app.online_buf, sty(ac(th))),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            lines.push(Line::from(""));
+            for (key, label, desc) in [
+                ("C", "CREATE ROOM", "Get a code to share with your friend"),
+                ("J", "JOIN ROOM  ", "Enter a code your friend shared"),
+            ] {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  [{key}]  "), sty(ac(th)).add_modifier(Modifier::BOLD)),
+                    Span::styled(label, sty(CREAM).add_modifier(Modifier::BOLD)),
+                ]));
+                lines.push(Line::from(vec![Span::styled(format!("        {desc}"), sty(DIM))]));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled("  Esc go back", sty(DIMMER))]));
+        }
+        OnlineStep::EnterRoom => {
+            lines.push(Line::from(vec![Span::styled("  ENTER ROOM CODE", sty(DIM))]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ▶ ", sty(ac(th))),
+                Span::styled(
+                    format!("{:<8}", &app.online_buf),
+                    Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled("  Ask your friend for their 6-char room code", sty(DIMMER))]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled("  Enter join    Esc back", sty(DIMMER))]));
+        }
+        OnlineStep::Connecting => {
+            lines.push(Line::from(vec![Span::styled("  Connecting…", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+        }
+    }
+
+    if !app.online_msg.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            format!("  ⚠  {}", app.online_msg),
+            Style::default().fg(Color::Yellow),
+        )]));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ── ONLINE WAITING ────────────────────────────────────────────────────────────
+fn draw_online_waiting(app: &App, f: &mut Frame) {
+    let th   = app.cfg.theme;
+    let rect = center(58, 20, f.area());
+    f.render_widget(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
+        rect,
+    );
+    let inner = pad(rect, 2, 1);
+
+    // Spinner animation based on tick (online_ping_tick cycles 0-99)
+    let spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+    let spin = spinner[(app.online_ping_tick as usize / 5) % spinner.len()];
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled("  ⚡ ONLINE  —  WAITING", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![Span::styled(format!("  {:─<50}", ""), sty(DIMMER))]),
+        Line::from(""),
+    ];
+
+    if !app.online_room_code.is_empty() {
+        lines.push(Line::from(vec![Span::styled("  YOUR ROOM CODE", sty(DIM))]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("       ", sty(DIM)),
+            Span::styled(
+                format!("  {}  ", app.online_room_code),
+                Style::default()
+                    .fg(bg0(th)).bg(ac(th))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  Share this code with your friend", sty(DIMMER))]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(format!("  {:─<50}", ""), sty(DIMMER))]));
+        lines.push(Line::from(""));
+    }
+
+    // Status message
+    let status = if app.online_msg.is_empty() {
+        format!("{spin}  Connecting…")
+    } else {
+        format!("{spin}  {}", app.online_msg)
+    };
+    lines.push(Line::from(vec![Span::styled(format!("  {}", status), sty(ac(th)))]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<50}", ""), sty(DIMMER))]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled("  Esc / q  cancel", sty(DIMMER))]));
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
