@@ -203,6 +203,8 @@ pub struct App {
     pub board_col_off: usize,
     pub board_row_off: usize,
     // FEN input screen
+    pub cell_w:          u16,
+    pub cell_h:          u16,
     pub fen_input_buf:   String,
     pub fen_input_err:   Option<String>,
     // PGN import screen
@@ -248,7 +250,21 @@ impl App {
             puzzle_state: crate::puzzle::PuzzleState::Loading,
             puzzle_move_idx: 0,
             puzzle_rx: None,
+            cell_w: 8, cell_h: 4,
         }
+    }
+
+    /// Auto-compute board cell dimensions from terminal area.
+    /// Call once per frame before drawing.
+    pub fn update_cell_size(&mut self, term_w: u16, term_h: u16) {
+        let coords = self.cfg.show_coords;
+        let overhead_w: u16 = if coords { 8 } else { 2 };
+        let overhead_h: u16 = if coords { 4 } else { 2 };
+        let avail_w = term_w.saturating_sub(overhead_w);
+        let avail_h = term_h.saturating_sub(1 + 4 + overhead_h);
+        let cw = (avail_w / 8).max(3).min(24);
+        self.cell_w = cw;
+        self.cell_h = (cw / 2).max(2).min(12);
     }
 
     pub fn flipped(&self) -> bool {
@@ -784,7 +800,7 @@ impl App {
     pub fn handle_settings_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Up   | KeyCode::Char('k') => { if self.settings_cur > 0  { self.settings_cur -= 1; } }
-            KeyCode::Down | KeyCode::Char('j') => { if self.settings_cur < 17 { self.settings_cur += 1; } }
+            KeyCode::Down | KeyCode::Char('j') => { if self.settings_cur < 15 { self.settings_cur += 1; } }
             KeyCode::Left | KeyCode::Char('h') => self.settings_cycle(false),
             KeyCode::Right| KeyCode::Char('l') => self.settings_cycle(true),
             KeyCode::Char('w') | KeyCode::Char('s') => { self.cfg.save(); self.saved_notice = Some(120); }
@@ -817,12 +833,10 @@ impl App {
                 self.restart_analysis_engine();
             }
             13 => self.cfg.auto_save_png   = !self.cfg.auto_save_png,
-            14 => {
+             14 => {
                 let cur = self.cfg.highlight_brightness as i16;
                 self.cfg.highlight_brightness = if fwd { (cur + 1).min(10) as u8 } else { (cur - 1).max(0) as u8 };
             }
-            15 => self.cfg.cell_w = if fwd { (self.cfg.cell_w + 1).min(20) } else { self.cfg.cell_w.saturating_sub(1).max(4) },
-            16 => self.cfg.cell_h = if fwd { (self.cfg.cell_h + 1).min(10) } else { self.cfg.cell_h.saturating_sub(1).max(2) },
             12 => {
                 self.cfg.analysis_depth = if fwd {
                     (self.cfg.analysis_depth % 3) + 1
@@ -983,9 +997,9 @@ impl App {
                     || self.gs.clock_state == ClockState::Flagged;
         let human = is_puzzle || self.mode == Mode::PvP || self.gs.turn == self.player_color;
         if !human || over || self.thinking { return; }
-        // Read from config — must stay in sync with draw_board
-        let cell_w: usize = self.cfg.cell_w as usize;
-        let cell_h: usize = self.cfg.cell_h as usize;
+        // Board cell dimensions (computed each frame from terminal size)
+        let cell_w = self.cell_w as usize;
+        let cell_h = self.cell_h as usize;
         // Row 0 = top bar, row 1 = board border top
         // Then optional coord row, then 8*CELL_H board rows
         const TOP_BAR: usize = 1;

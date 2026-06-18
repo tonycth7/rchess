@@ -10,6 +10,7 @@ use ratatui::{
 use crate::app::{App, Gs, Mode, Screen, ClockState, GameEnd, ReplaySnap, MoveLabel, VERSION};
 use crate::config::{MoveHints, PieceStyle, Theme, UiMode};
 use crate::engine::{Color as PC, Kind, Status, king_sq};
+use crate::pieces;
 
 // ── Palette helpers ───────────────────────────────────────────────────────────
 fn rgb(c: (u8,u8,u8)) -> Color { Color::Rgb(c.0,c.1,c.2) }
@@ -30,10 +31,7 @@ const TEAL:   Color = Color::Rgb(80, 180,140);
 const AMBER:  Color = Color::Rgb(220,160, 40);
 const GREEN:  Color = Color::Rgb(120,220,160);
 
-// CELL_W and CELL_H are now read from app.cfg.cell_w / app.cfg.cell_h
-// Defaults kept here as fallback for non-game screens
-const DEFAULT_CELL_W: usize = 8;
-const DEFAULT_CELL_H: usize = 4;
+// Board cell dimensions are auto-computed from terminal size each frame.
 
 // Safely truncate to max visible chars
 fn trunc(s: &str, max: usize) -> String {
@@ -181,8 +179,6 @@ fn draw_settings(app: &App, f: &mut Frame) {
         ("Analysis depth",   match app.cfg.analysis_depth { 1=>"1  (fast)", 2=>"2  (balanced)", _=>"3  (strong)" }),
         ("Auto-save PNG",    if app.cfg.auto_save_png  {"ON"} else {"OFF"}),
         ("Highlight bright", highlight_str),
-        ("Board cell width",  match app.cfg.cell_w { 4=>"4 (tiny)", 6=>"6 (small)", 8=>"8 (default)", 10=>"10 (large)", 12=>"12 (huge)", n => Box::leak(format!("{}", n).into_boxed_str()) }),
-        ("Board cell height", match app.cfg.cell_h { 2=>"2 (flat)", 3=>"3", 4=>"4 (default)", 5=>"5", 6=>"6 (tall)", n => Box::leak(format!("{}", n).into_boxed_str()) }),
         ("Lichess token",    if app.cfg.lichess_token.is_empty() {"(not set)"} else {"(configured ✓)"}),
     ];
     let n = rows.len();
@@ -263,61 +259,19 @@ fn draw_settings(app: &App, f: &mut Frame) {
 
 
 // ── BLOCK ART PIECES ──────────────────────────────────────────────────────────
-// Each piece is defined as 5 rows × 9 chars using block characters.
-// ' ' = square bg shows through, '█' = piece colour.
-// Pieces are designed to be visually distinct at a glance.
-fn piece_block_row(k: Kind, line: usize) -> &'static str {
-    match (k, line) {
-        // ── Pawn: round head, tapered body, wide base ─────────────────────────
-        (Kind::P, 0) => "         ",
-        (Kind::P, 1) => "   ███   ",
-        (Kind::P, 2) => "   ███   ",
-        (Kind::P, 3) => "  █████  ",
-        (Kind::P, _) => "         ",
-        // ── Knight: L-shaped head charging left ───────────────────────────────
-        (Kind::N, 0) => "   ████  ",
-        (Kind::N, 1) => "  █████  ",
-        (Kind::N, 2) => "  ████   ",
-        (Kind::N, 3) => "  █████  ",
-        (Kind::N, _) => "         ",
-        // ── Bishop: tall diamond/mitre shape ──────────────────────────────────
-        (Kind::B, 0) => "    █    ",
-        (Kind::B, 1) => "   ███   ",
-        (Kind::B, 2) => "  █████  ",
-        (Kind::B, 3) => " ███████ ",
-        (Kind::B, _) => "         ",
-        // ── Rook: battlements on top ───────────────────────────────────────────
-        (Kind::R, 0) => " █ █ █ █ ",
-        (Kind::R, 1) => " ███████ ",
-        (Kind::R, 2) => "  █████  ",
-        (Kind::R, 3) => " ███████ ",
-        (Kind::R, _) => "         ",
-        // ── Queen: wide crown with 5 points ───────────────────────────────────
-        (Kind::Q, 0) => " █ █ █ █ ",
-        (Kind::Q, 1) => " ███████ ",
-        (Kind::Q, 2) => " ███████ ",
-        (Kind::Q, 3) => " ███████ ",
-        (Kind::Q, _) => "         ",
-        // ── King: cross on top, solid body ────────────────────────────────────
-        (Kind::K, 0) => "    █    ",
-        (Kind::K, 1) => "  █████  ",
-        (Kind::K, 2) => "  █████  ",
-        (Kind::K, 3) => " ███████ ",
-        (Kind::K, _) => "         ",
-    }
-}
+// Delegates to pieces::render_block_lines for dynamic scaling.
 
 // ── GAME ──────────────────────────────────────────────────────────────────────
 fn draw_game(app: &App, f: &mut Frame) {
-    let a  = f.area();
-    let cell_w = app.cfg.cell_w as u16;
-    let bw = (3 + 8*cell_w + 3 + 2).min(a.width);
-    let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(a);
-    let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Min(0)]).areas(body);
-    let [board_area, input_area] = Layout::vertical([Constraint::Min(0), Constraint::Length(4)]).areas(board_col);
+    let a     = f.area();
+    let cw    = app.cell_w;
+    let bw    = (3 + 8*cw + 3 + 2).min(a.width);
+    let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(a);
+    let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Fill(1)]).areas(body);
+    let [board_area, input_area] = Layout::vertical([Constraint::Fill(1), Constraint::Length(4)]).areas(board_col);
 
     draw_topbar(app, f, top);
-    draw_board(app, f, board_area);
+    draw_board(app, f, board_area, app.cell_w as usize, app.cell_h as usize);
     draw_input(app, f, input_area);
     draw_sidebar(app, f, side_col);
 
@@ -364,11 +318,11 @@ fn draw_topbar(app: &App, f: &mut Frame, area: Rect) {
 }
 
 // ── BOARD ─────────────────────────────────────────────────────────────────────
-fn draw_board(app: &App, f: &mut Frame, area: Rect) {
+fn draw_board(app: &App, f: &mut Frame, area: Rect, cell_w: usize, cell_h: usize) {
     #[allow(non_snake_case)]
-    let CELL_W = app.cfg.cell_w as usize;
+    let CELL_W = cell_w;
     #[allow(non_snake_case)]
-    let CELL_H = app.cfg.cell_h as usize;
+    let CELL_H = cell_h;
     let th      = app.cfg.theme;
     let flipped = app.flipped();
     let row_ord: Vec<usize> = if flipped { (0..8).rev().collect() } else { (0..8).collect() };
@@ -454,14 +408,15 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect) {
                     else if is_light     { sq_l(th) }
                     else                 { sq_d(th) };
 
-                let is_blocks = matches!(app.cfg.piece_style, PieceStyle::Blocks);
+                let use_blocks = matches!(app.cfg.piece_style, PieceStyle::Blocks)
+                    || (CELL_W >= 6 && !matches!(app.cfg.piece_style, PieceStyle::Letters | PieceStyle::FatLetters));
 
-                let (cell_str, mut style) = if is_blocks {
-                    // Block art: every row of the cell renders a slice of the piece shape
+                let (cell_str, mut style) = if use_blocks {
                     let (row_str, fg) = if let Some(p) = piece {
-                        let row = piece_block_row(p.k, line_idx);
+                        let lines = crate::pieces::render_block_lines(p, CELL_W, CELL_H);
+                        let row_str = lines.get(line_idx).cloned().unwrap_or_else(|| " ".repeat(CELL_W));
                         let fg  = if p.c == PC::White { pw(th) } else { pb_c(th) };
-                        (row.to_string(), fg)
+                        (row_str, fg)
                     } else if is_tgt && matches!(app.cfg.move_hints, MoveHints::Dots) && line_idx == CELL_H/2 {
                         (center_str("⬤", CELL_W), hint_fg)
                     } else {
@@ -568,7 +523,7 @@ fn draw_sidebar(app: &App, f: &mut Frame, area: Rect) {
         UiMode::Minimal => {
             let [pl, st, hi, kb] = Layout::vertical([
                 Constraint::Length(7), Constraint::Length(5),
-                Constraint::Min(3),    Constraint::Length(8),
+                Constraint::Fill(1),   Constraint::Length(8),
             ]).areas(area);
             draw_players(app, f, pl);
             draw_status(app, f, st);
@@ -578,7 +533,7 @@ fn draw_sidebar(app: &App, f: &mut Frame, area: Rect) {
         UiMode::Standard => {
             let [pl, st, an, hi, kb] = Layout::vertical([
                 Constraint::Length(7), Constraint::Length(5),
-                Constraint::Length(5), Constraint::Min(3),
+                Constraint::Length(5), Constraint::Fill(1),
                 Constraint::Length(8),
             ]).areas(area);
             draw_players(app, f, pl);
@@ -590,7 +545,7 @@ fn draw_sidebar(app: &App, f: &mut Frame, area: Rect) {
         UiMode::Analysis => {
             let [pl, st, an, hi, kb] = Layout::vertical([
                 Constraint::Length(7), Constraint::Length(5),
-                Constraint::Length(7), Constraint::Min(3),
+                Constraint::Length(7), Constraint::Fill(1),
                 Constraint::Length(8),
             ]).areas(area);
             draw_players(app, f, pl);
@@ -990,12 +945,12 @@ fn draw_draw_offer(app: &App, f: &mut Frame) {
 fn draw_replay(app: &App, f: &mut Frame) {
     let th = app.cfg.theme;
     let a  = f.area();
-    let cell_w = app.cfg.cell_w as u16;
+    let cw = app.cell_w;
     f.render_widget(Block::default().style(Style::default().bg(bg0(th))), a);
 
-    let bw = (3 + 8*cell_w + 3 + 2).min(a.width);
-    let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(a);
-    let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Min(0)]).areas(body);
+    let bw = (3 + 8*cw + 3 + 2).min(a.width);
+    let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(a);
+    let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Fill(1)]).areas(body);
 
     let snap  = app.replay_snaps.get(app.replay_idx);
     let title = format!(" ♟ RChess — REPLAY  [{}/{}]  {}",
@@ -1005,7 +960,7 @@ fn draw_replay(app: &App, f: &mut Frame) {
     // Split board column: narrow eval bar on left, board on right
     let [eval_bar_col, actual_board_col] = Layout::horizontal([
         Constraint::Length(4),
-        Constraint::Min(0),
+        Constraint::Fill(1),
     ]).areas(board_col);
 
     if let Some(snap) = snap { draw_replay_board(app, f, actual_board_col, snap); }
@@ -1019,9 +974,9 @@ fn draw_replay(app: &App, f: &mut Frame) {
 
 fn draw_replay_board(app: &App, f: &mut Frame, area: Rect, snap: &ReplaySnap) {
     #[allow(non_snake_case)]
-    let CELL_W = app.cfg.cell_w as usize;
+    let CELL_W = app.cell_w as usize;
     #[allow(non_snake_case)]
-    let CELL_H = app.cfg.cell_h as usize;
+    let CELL_H = app.cell_h as usize;
     let th      = app.cfg.theme;
     let flipped = app.flipped();
     let row_ord: Vec<usize> = if flipped{(0..8).rev().collect()}else{(0..8).collect()};
@@ -1173,7 +1128,7 @@ fn draw_replay_sidebar(app: &App, f: &mut Frame, area: Rect) {
     let th = app.cfg.theme;
     let [info_area, review_area, hist_area, keys_area] = Layout::vertical([
         Constraint::Length(5), Constraint::Length(7),
-        Constraint::Min(3),    Constraint::Length(6),
+        Constraint::Fill(1),   Constraint::Length(6),
     ]).areas(area);
 
     // ── Position info ─────────────────────────────────────────────────────────
@@ -1789,10 +1744,10 @@ fn draw_puzzle(app: &App, f: &mut Frame) {
         }
         state => {
             // Puzzle is loaded — show board + info panel
-            let cell_w = app.cfg.cell_w as u16;
-            let bw = (3 + 8 * cell_w + 3 + 2).min(a.width);
-            let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(a);
-            let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Min(0)]).areas(body);
+            let cw = app.cell_w;
+            let bw = (3 + 8 * cw + 3 + 2).min(a.width);
+            let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(a);
+            let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Fill(1)]).areas(body);
 
             // Top bar
             let puzzle = app.puzzle.as_ref();
@@ -1824,7 +1779,7 @@ fn draw_puzzle(app: &App, f: &mut Frame) {
             );
 
             // Board (reuse draw_board logic for the puzzle position)
-            draw_board(app, f, board_col);
+            draw_board(app, f, board_col, app.cell_w as usize, app.cell_h as usize);
 
             // Side panel
             draw_puzzle_sidebar(app, f, side_col);
@@ -1836,7 +1791,7 @@ fn draw_puzzle_sidebar(app: &App, f: &mut Frame, area: Rect) {
     use crate::puzzle::PuzzleState;
     let th = app.cfg.theme;
     let [info_area, input_area, keys_area] = Layout::vertical([
-        Constraint::Length(8), Constraint::Length(5), Constraint::Min(3),
+        Constraint::Length(8), Constraint::Length(5), Constraint::Fill(1),
     ]).areas(area);
 
     // Puzzle info

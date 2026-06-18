@@ -300,10 +300,6 @@ pub struct Config {
     pub analysis_depth: u8,
     /// Highlight brightness 0-10 (0=subtle, 5=default, 10=vivid)
     pub highlight_brightness: u8,
-    /// Board cell width in chars (default 8). Increase to make board bigger.
-    pub cell_w: u8,
-    /// Board cell height in lines (default 4). Keep cell_w ≈ cell_h*2 for square cells.
-    pub cell_h: u8,
 }
 
 impl Default for Config {
@@ -329,8 +325,6 @@ impl Default for Config {
             analysis_engine: AnalysisEngine::Builtin,
             analysis_depth: 2,
             highlight_brightness: 5,
-            cell_w: 8,
-            cell_h: 4,
         }
     }
 }
@@ -398,8 +392,6 @@ impl Config {
                         },
                         "analysis_depth" => cfg.analysis_depth = val.parse::<u8>().unwrap_or(2).clamp(1, 3),
                         "highlight_brightness" => cfg.highlight_brightness = val.parse::<u8>().unwrap_or(5).clamp(0, 10),
-                        "cell_w" => cfg.cell_w = val.parse::<u8>().unwrap_or(8).clamp(4, 20),
-                        "cell_h" => cfg.cell_h = val.parse::<u8>().unwrap_or(4).clamp(2, 10),
                         _ => {}
                     }
                 }
@@ -440,9 +432,7 @@ impl Config {
                  stockfish_skill  = {}\n\
                  analysis_engine  = {}\n\
                  analysis_depth   = {}\n\
-                 highlight_brightness = {}\n\
-                 cell_w           = {}\n\
-                 cell_h           = {}\n",
+                  highlight_brightness = {}\n",
                 match self.theme {
                     Theme::Classic=>"classic", Theme::Tournament=>"tournament",
                     Theme::Mocha=>"mocha",    Theme::Slate=>"slate",
@@ -478,7 +468,6 @@ impl Config {
                 },
                 self.analysis_depth,
                 self.highlight_brightness,
-                self.cell_w, self.cell_h,
             ));
         }
     }

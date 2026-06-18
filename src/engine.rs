@@ -226,3 +226,55 @@ pub fn mv_to_san(board: &Board, mv: &Mv, ep: Option<(usize,usize)>, cast: &Castl
     }
     s
 }
+
+// ── Zobrist hashing ───────────────────────────────────────────────────────────
+pub fn piece_index(c: Color, k: Kind) -> usize {
+    let ki = match k { Kind::P=>0, Kind::N=>1, Kind::B=>2, Kind::R=>3, Kind::Q=>4, Kind::K=>5 };
+    match c { Color::White => ki, Color::Black => ki + 6 }
+}
+
+struct XorShift64(u64);
+impl XorShift64 {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+struct ZobristTable {
+    pieces: [[u64; 64]; 12],
+    side:   u64,
+    ep:     [u64; 8],
+    castle: [u64; 4],
+}
+
+use std::sync::OnceLock;
+static ZOBRIST: OnceLock<ZobristTable> = OnceLock::new();
+
+fn init_zobrist() -> ZobristTable {
+    let mut rng = XorShift64(1804289383);
+    let mut pieces = [[0u64; 64]; 12];
+    for set in pieces.iter_mut() {
+        for sq in set.iter_mut() { *sq = rng.next(); }
+    }
+    ZobristTable { pieces, side: rng.next(), ep: [rng.next(),rng.next(),rng.next(),rng.next(),rng.next(),rng.next(),rng.next(),rng.next()], castle: [rng.next(),rng.next(),rng.next(),rng.next()] }
+}
+
+pub fn zobrist_hash(b: &Board, stm: Color, ep: Option<(usize,usize)>, cast: &Castle) -> u64 {
+    let z = ZOBRIST.get_or_init(init_zobrist);
+    let mut h = 0u64;
+    for r in 0..8 {
+        for c in 0..8 {
+            if let Some(p) = b[r][c] {
+                h ^= z.pieces[piece_index(p.c, p.k)][r * 8 + c];
+            }
+        }
+    }
+    if stm == Color::Black { h ^= z.side; }
+    if let Some((_, cf)) = ep { h ^= z.ep[cf]; }
+    if cast.wk { h ^= z.castle[0]; } if cast.wq { h ^= z.castle[1]; }
+    if cast.bk { h ^= z.castle[2]; } if cast.bq { h ^= z.castle[3]; }
+    h
+}

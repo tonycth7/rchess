@@ -11,8 +11,10 @@ mod book;
 mod app;
 mod config;
 mod ui;
+mod pieces;
 mod png_export;
 mod analysis;
+mod tt;
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -82,6 +84,9 @@ fn main() -> io::Result<()> {
     let mut last_tick = Instant::now();
 
     loop {
+        if let Ok((tw, th)) = crossterm::terminal::size() {
+            app.update_cell_size(tw, th);
+        }
         term.draw(|f| ui::render(&app, f))?;
 
         let timeout = tick.checked_sub(last_tick.elapsed()).unwrap_or_default();
