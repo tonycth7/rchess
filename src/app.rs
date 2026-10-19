@@ -1,17 +1,26 @@
 // src/app.rs
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::fs;
 use std::path::PathBuf;
 use crossterm::event::KeyCode;
 use crate::engine::*;
 use crate::ai::best_mv;
-use crate::config::{Config, PieceStyle, TimeControl, UiMode};
-use crate::lichess::{Challenge, LichessEvent, GameStreamEvent};
+use crate::config::{Config, PieceStyle, Setting, TimeControl, UiMode};
+use crate::lichess::{is_terminal_status, Challenge, GameState, GameStreamEvent, LichessEvent, OngoingGame};
 use crate::net::client::LichessNetClient;
 
 pub const VERSION: &str = "0.7.3";
+
+/// Time controls accepted by `/api/board/seek` for non-bot accounts
+/// (Lichess requires `limit*60 + increment*40 > 300`).
+pub const ONLINE_TCS: &[(&str, (u32, u32))] = &[
+    ("10+0",  (10, 0)),
+    ("5+5",   (5, 5)),
+    ("15+10", (15, 10)),
+    ("30+0",  (30, 0)),
+];
 
 fn whoami() -> String {
     std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "Player".into())
@@ -209,6 +218,8 @@ pub struct App {
     pub eval_history: Vec<i32>,
     // Misc
     pub should_quit:  bool,
+    /// `?` help overlay (drawn on top of the current screen).
+    pub help:         bool,
     pub saved_notice: Option<u8>,
     pub undo_stack: Vec<(Gs, usize, usize)>,
     pub redo_stack: Vec<(Gs, usize, usize)>,
@@ -235,13 +246,32 @@ pub struct App {
     pub lichess_challenges: Vec<Challenge>,
     pub challenge_buf:    String,
     pub challenge_mode:   bool,
+    pub challenge_cur:    usize,
     pub online_status:    String,
     pub online_rated:     bool,
     pub online_tc_idx:    usize,
     pub online_seeking:   bool,
+    /// When the current seek was registered (used to expire it client-side).
+    pub online_seek_at:   Option<Instant>,
     pub online_chat_mode: bool,
     pub chat_buf:         String,
     pub chat_messages:    Vec<String>,
+    /// Ongoing Lichess games, fetched on connect so a dropped game can be resumed.
+    pub online_games:     Vec<OngoingGame>,
+    /// Client-side mirror of the server's move list (UCI), used to apply diffs.
+    pub online_moves:     Vec<String>,
+    /// Starting position of the online game ("startpos" or a FEN).
+    pub online_base_fen:  String,
+    /// Result banner shown over the board when an online game ends.
+    pub online_result:    Option<String>,
+    /// e.g. "Rated classical" from the gameFull payload.
+    pub online_tc_label:  String,
+    /// Inline token editor on the settings screen.
+    pub token_edit:       bool,
+    pub token_buf:        String,
+    pub token_err:        Option<String>,
+    /// Explicit PGN result tag (online games know the result from the server).
+    pub pgn_result:       Option<String>,
     pub saved_games: Vec<(std::path::PathBuf, crate::save::GameSave)>,
     // Screen stack for e.g. Settings → back to Game
     pub prev_screen:  Screen,
@@ -276,7 +306,7 @@ impl App {
             move_reviews: vec![],
             last_eval_cp: 0,
             eval_history: vec![0],  // start with balanced
-            should_quit: false, saved_notice: None, undo_stack: vec![], redo_stack: vec![],
+            should_quit: false, help: false, saved_notice: None, undo_stack: vec![], redo_stack: vec![],
             game_end: GameEnd::Normal,
             board_col_off: 4, board_row_off: 3,
             import_buf: String::new(), import_err: None,
@@ -294,13 +324,24 @@ impl App {
             lichess_challenges: vec![],
             challenge_buf: String::new(),
             challenge_mode: false,
+            challenge_cur: 0,
             online_status: "Set lichess_token in Settings".into(),
             online_rated: false,
             online_tc_idx: 2,
             online_seeking: false,
+            online_seek_at: None,
             online_chat_mode: false,
             chat_buf: String::new(),
             chat_messages: vec![],
+            online_games: vec![],
+            online_moves: vec![],
+            online_base_fen: "startpos".into(),
+            online_result: None,
+            online_tc_label: String::new(),
+            token_edit: false,
+            token_buf: String::new(),
+            token_err: None,
+            pgn_result: None,
             saved_games: vec![],
             prev_screen: Screen::Menu,
             show_hints: false,
@@ -344,6 +385,24 @@ impl App {
     }
 
     // ── Start game ────────────────────────────────────────────────────────────
+    /// Forget any online game so local play can never post moves to a stale
+    /// Lichess game (e.g. after importing a PGN or loading a saved game).
+    pub fn clear_online_state(&mut self) {
+        self.lichess_game_id = None;
+        self.lichess_opponent = None;
+        self.lichess_opponent_rating = None;
+        self.online_moves.clear();
+        self.online_base_fen = "startpos".into();
+        self.online_result = None;
+        self.online_tc_label.clear();
+        self.online_status.clear();
+        self.chat_messages.clear();
+        self.online_chat_mode = false;
+        self.chat_buf.clear();
+        self.online_seeking = false;
+        self.online_seek_at = None;
+    }
+
     pub fn start_game(&mut self) {
         // Don't clear lichess_state — it's set before start_game is called
         let lichess_game_id = self.lichess_game_id.clone();
@@ -361,6 +420,7 @@ impl App {
         self.png_export_path = None; self.png_notice = None; self.png_preview_path = None;
         self.replay_snaps.clear(); self.game_end = GameEnd::Normal;
         self.show_hints = false; self.arrows.clear();
+        self.pgn_result = None; self.online_result = None;
         self.online_chat_mode = false; self.chat_buf.clear();
         self.last_tick = Instant::now();
         self.engine_busy = false;
@@ -437,9 +497,7 @@ impl App {
 
     // ── Main 50 ms tick ───────────────────────────────────────────────────────
     pub fn poll_ai(&mut self) {
-        if self.screen != Screen::OnlineGame && self.screen != Screen::DrawOffer {
-            self.tick_clock();
-        }
+        self.tick_clock();
         self.poll_minimax();
         self.poll_analysis();
         self.poll_lichess();
@@ -474,6 +532,7 @@ impl App {
     }
 
     fn poll_lichess(&mut self) {
+        // Account-wide events (challenges, new games) arrive regardless of screen.
         let events = {
             let mut v = vec![];
             if let Some(c) = &mut self.lichess {
@@ -497,135 +556,358 @@ impl App {
                     self.lichess_challenges.retain(|c| c.id != id);
                     self.online_status = "Challenge declined".into();
                 }
-                LichessEvent::GameStarted { game_id, opponent_name, opponent_rating, color } => {
-                    self.lichess_game_id = Some(game_id.clone());
-                    self.lichess_opponent = Some(opponent_name.clone());
-                    self.lichess_opponent_rating = opponent_rating;
-                    self.lichess_challenges.clear();
-                    self.player_color = color;
-                    self.mode = Mode::PvP;
-                    self.start_game();
-                    self.screen = Screen::OnlineGame;
-                    self.online_status = format!("Playing {opponent_name} on Lichess");
-                    rlog!("[lichess] game started vs {opponent_name} id={game_id} color={color:?}");
-                    if let Some(client) = &mut self.lichess {
-                        client.start_game_stream(&game_id);
+                LichessEvent::GameStarted { game_id, opponent_name, opponent_rating, color, variant } => {
+                    // The engine and board are standard chess only.
+                    let v = variant.to_ascii_lowercase();
+                    if v != "standard" && v != "fromposition" {
+                        rlog!("[lichess] refusing unsupported variant {variant}");
+                        self.online_status = format!(
+                            "{variant} games are not supported (standard chess only)"
+                        );
+                        if let Some(c) = &self.lichess {
+                            if let Err(e) = c.abort_game(&game_id) {
+                                rlog!("[lichess] abort unsupported variant: {e}");
+                            }
+                        }
+                        continue;
+                    }
+                    let already = self.lichess_game_id.as_deref() == Some(game_id.as_str());
+                    let busy = self.screen == Screen::OnlineGame
+                        && self.lichess_game_id.is_some()
+                        && !already;
+                    if busy {
+                        self.online_status = format!(
+                            "Another game started vs {opponent_name} - finish the current one first"
+                        );
+                        continue;
+                    }
+                    if !already {
+                        rlog!("[lichess] game started vs {opponent_name} id={game_id} color={color:?}");
+                        self.begin_online_game(game_id, opponent_name, opponent_rating, color);
                     }
                 }
                 LichessEvent::GameFinished { result, .. } => {
                     self.online_status = format!("Game over: {result}");
-                    if self.screen == Screen::OnlineGame {
-                        self.replay_result = result.clone();
-                        self.export_pgn();
-                        if self.cfg.auto_save_png {
-                            self.auto_png_export();
-                        }
-                    }
                 }
                 LichessEvent::Error(msg) => {
                     self.online_status = format!("Lichess: {msg}");
                 }
             }
         }
-        // Collect game stream messages
-        if self.screen == Screen::OnlineGame {
-            let g_events = {
-                let mut v = vec![];
-                if let Some(c) = &mut self.lichess {
-                    while let Some(e) = c.poll_game() { v.push(e); }
+
+        // Game-specific events. Keep polling while a game id is known, even if
+        // the user is in Settings, so moves and clocks are never missed.
+        if self.lichess_game_id.is_none() { return; }
+        let g_events = {
+            let mut v = vec![];
+            if let Some(c) = &mut self.lichess {
+                while let Some(e) = c.poll_game() { v.push(e); }
+            }
+            v
+        };
+        for event in g_events {
+            match event {
+                GameStreamEvent::GameFull { base_fen, state, w_name, b_name, w_rating, b_rating, color, speed, rated, initial_ms, increment_ms } => {
+                    if let Some(c) = color { self.player_color = c; }
+                    let (my_name, opp_name, opp_rating) = if self.player_color == Color::White {
+                        (w_name, b_name, b_rating)
+                    } else {
+                        (b_name, w_name, w_rating)
+                    };
+                    if self.player_name.is_empty() || self.player_name == whoami() {
+                        self.player_name = my_name;
+                    }
+                    self.lichess_opponent = Some(opp_name.clone());
+                    self.lichess_opponent_rating = opp_rating;
+                    if initial_ms > 0 {
+                        let mins = initial_ms / 60_000;
+                        let inc_s = increment_ms / 1000;
+                        self.online_tc_label = format!(
+                            "{} {mins}+{inc_s}",
+                            if rated { "Rated" } else { "Casual" },
+                        );
+                    } else if !speed.is_empty() {
+                        self.online_tc_label = format!(
+                            "{} {speed}",
+                            if rated { "Rated" } else { "Casual" },
+                        );
+                    }
+                    self.online_base_fen = base_fen.clone();
+                    self.rebuild_online_board(&state.moves, &base_fen);
+                    self.online_moves = state.moves.clone();
+                    self.apply_online_clocks(&state);
+                    self.online_status = format!("Online game vs {opp_name}");
+                    if is_terminal_status(&state.status) {
+                        self.finish_online(&state);
+                    } else {
+                        self.handle_game_offers(&state);
+                    }
                 }
-                v
-            };
-            for event in g_events {
-                match event {
-                    GameStreamEvent::GameFull { fen, moves, w_ms, b_ms, w_name, b_name, .. } => {
-                        // Dedup: if we already have these moves, skip replay
-                        if self.gs.history.len() >= moves.len() {
-                            self.gs.white_ms = Some(w_ms);
-                            self.gs.black_ms = Some(b_ms);
-                        } else {
-                            if fen != "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" {
-                                if let Ok((board, turn, ep, cast, _)) = crate::puzzle::parse_fen(&fen) {
-                                    self.gs.board = board;
-                                    self.gs.turn = turn;
-                                    self.gs.ep = ep;
-                                    self.gs.cast = cast;
-                                }
-                            }
-                            self.gs.white_ms = Some(w_ms);
-                            self.gs.black_ms = Some(b_ms);
-                            let start_idx = self.gs.history.len();
-                            for m in &moves[start_idx..] {
-                                if let Ok(mv) = parse_notation(
-                                    &self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, m
-                                ) {
-                                    let (b, e, c) = apply(&self.gs.board, &mv, self.gs.ep, &self.gs.cast);
-                                    self.gs.board = b;
-                                    self.gs.ep = e;
-                                    self.gs.cast = c;
-                                    self.gs.turn = self.gs.turn.opp();
-                                    self.gs.history.push(HistEntry {
-                                        notation: m.clone(),
-                                        san: m.clone(),
-                                        color: self.gs.turn,
-                                        from: mv.fr, to: mv.to,
-                                        move_time_ms: 0,
-                                    });
-                                    if mv.fr.0 == 0 && self.gs.turn == Color::Black {
-                                        self.gs.fullmove += 1;
-                                    }
-                                }
-                            }
-                        }
-                        self.online_status = format!("Playing {} vs {}", w_name, b_name);
-                    }
-                    GameStreamEvent::MovePlayed { uci, w_ms, b_ms, .. } => {
-                        if !uci.is_empty() {
-                            if let Ok(mv) = parse_notation(
-                                &self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, &uci
-                            ) {
-                                self.execute(mv);
-                            } else {
-                                rlog!("[lichess] MovePlayed parse failed: {uci} board turn={:?}", self.gs.turn);
-                            }
-                        }
-                        self.gs.white_ms = Some(w_ms);
-                        self.gs.black_ms = Some(b_ms);
-                    }
-                    GameStreamEvent::GameEnd { result, winner: _ } => {
-                        self.online_status = format!("Game over: {result}");
-                        if result == "mate" { self.gs.status = Status::Checkmate; }
-                        else if result == "draw" { self.gs.status = Status::Draw; self.game_end = GameEnd::Draw; }
-                        else { self.gs.status = Status::Stalemate; }
-                        self.finish_game();
-                    }
-                    GameStreamEvent::ChatLine { text, room } => {
-                        rlog!("[lichess] chat ({room}): {text}");
-                        if room == "player" {
-                            let who = self.lichess_opponent.as_deref().unwrap_or("Opponent");
-                            self.chat_messages.push(format!("{who}: {text}"));
-                            if self.chat_messages.len() > 50 { self.chat_messages.remove(0); }
-                            if text.contains("draw") || text.contains("Draw") {
-                                self.online_status = "Opponent offers draw".into();
-                                self.draw_offer = Some(self.gs.turn.opp());
-                                self.draw_offer_msg = Some(text);
-                                if self.screen == Screen::OnlineGame {
-                                    self.screen = Screen::DrawOffer;
-                                }
-                            }
-                        }
-                    }
-                    GameStreamEvent::Error(msg) => {
-                        rlog!("[lichess] game stream error: {msg}");
-                        self.online_status = if msg == "reconnecting" {
-                            "Reconnecting to game...".to_string()
-                        } else {
-                            format!("Stream error: {msg}")
+                GameStreamEvent::StateSync(state) => {
+                    self.sync_online_state(state);
+                }
+                GameStreamEvent::ChatLine { username, text, room } => {
+                    if room != "player" { continue; }
+                    self.push_chat(&username, &text);
+                }
+                GameStreamEvent::OpponentGone { gone, claim_win_in } => {
+                    if gone {
+                        self.online_status = match claim_win_in {
+                            Some(s) if s > 0 => format!("Opponent left - press v to claim victory ({s}s)"),
+                            _ => "Opponent left - press v to claim victory".into(),
                         };
+                    } else if self.online_result.is_none() {
+                        self.online_status = "Opponent is back".into();
                     }
+                }
+                GameStreamEvent::Error(msg) => {
+                    rlog!("[lichess] game stream error: {msg}");
+                    self.online_status = if msg == "reconnecting" {
+                        "Reconnecting to game...".to_string()
+                    } else {
+                        format!("Stream error: {msg}")
+                    };
                 }
             }
         }
+    }
+
+    // ── Online game state ─────────────────────────────────────────────────────
+
+    fn begin_online_game(
+        &mut self,
+        game_id: String,
+        opponent: String,
+        opponent_rating: Option<i32>,
+        color: Color,
+    ) {
+        self.lichess_game_id = Some(game_id.clone());
+        self.lichess_opponent = Some(opponent.clone());
+        self.lichess_opponent_rating = opponent_rating;
+        self.lichess_challenges.clear();
+        self.online_moves.clear();
+        self.online_base_fen = "startpos".into();
+        self.online_result = None;
+        self.online_tc_label.clear();
+        self.pgn_result = None;
+        self.draw_offer = None;
+        self.draw_offer_msg = None;
+        self.chat_messages.clear();
+        self.player_color = color;
+        self.mode = Mode::PvP;
+        self.start_game();
+        self.screen = Screen::OnlineGame;
+        // `flipped()` depends on the screen, so pick the starting cursor now.
+        self.cursor = if self.flipped() { (6, 3) } else { (6, 4) };
+        self.online_seeking = false;
+        self.online_seek_at = None;
+        self.online_status = format!("Waiting for {opponent} to move...");
+        if let Some(client) = &mut self.lichess {
+            client.stop_seek();
+            client.start_game_stream(&game_id);
+        }
+    }
+
+    /// Reset the board to `base_fen` (or startpos) and replay `moves`.
+    fn rebuild_online_board(&mut self, moves: &[String], base_fen: &str) {
+        self.gs = Gs::new(self.cfg.time_control);
+        self.gs.white_ms = None;
+        self.gs.black_ms = None;
+        self.gs.clock_state = ClockState::Paused;
+        if base_fen != "startpos" {
+            if let Ok((board, turn, ep, cast, fullmove)) = crate::puzzle::parse_fen(base_fen) {
+                self.gs.board = board;
+                self.gs.turn = turn;
+                self.gs.ep = ep;
+                self.gs.cast = cast;
+                self.gs.fullmove = fullmove;
+            } else {
+                rlog!("[lichess] unsupported initial position: {base_fen}");
+            }
+        }
+        self.gs.history.clear();
+        self.gs.cap_w.clear();
+        self.gs.cap_b.clear();
+        self.replay_snaps.clear();
+        self.move_reviews.clear();
+        self.eval_history = vec![0];
+        self.last_eval_cp = 0;
+        self.pending_analysis = None;
+        self.engine_busy = false;
+        self.analysis.drain_results();
+        self.selected = None;
+        self.targets.clear();
+        self.replay_snaps.push(ReplaySnap {
+            board: self.gs.board, turn: self.gs.turn,
+            notation: String::new(), mv_num: self.gs.fullmove,
+        });
+        for uci in moves {
+            if !self.push_server_move(uci) {
+                rlog!("[lichess] replay stopped at illegal move {uci}");
+                break;
+            }
+        }
+    }
+
+    /// Apply one server move without echoing it back to the API.
+    fn push_server_move(&mut self, uci: &str) -> bool {
+        let Ok(mv) = parse_notation(&self.gs.board, self.gs.turn, self.gs.ep, &self.gs.cast, uci)
+        else { return false; };
+        let Some(piece) = self.gs.board[mv.fr.0][mv.fr.1] else { return false; };
+        let mut cap = self.gs.board[mv.to.0][mv.to.1];
+        if cap.is_none() && mv.ep {
+            let cr = if piece.c == Color::White { mv.to.0 + 1 } else { mv.to.0.wrapping_sub(1) };
+            cap = self.gs.board[cr][mv.to.1];
+        }
+        let san  = mv_to_san(&self.gs.board, &mv, self.gs.ep, &self.gs.cast);
+        let (nb, ne, nc) = apply(&self.gs.board, &mv, self.gs.ep, &self.gs.cast);
+        let next  = piece.c.opp();
+        let new_s = game_status(&nb, next, ne, &nc);
+        if let Some(c) = cap {
+            if piece.c == Color::White { self.gs.cap_w.push(c); } else { self.gs.cap_b.push(c); }
+        }
+        let sfx = match new_s { Status::Checkmate => "#", Status::Check => "+", _ => "" };
+        self.gs.history.push(HistEntry {
+            notation: uci.to_string(),
+            san: format!("{san}{sfx}"),
+            color: piece.c,
+            from: mv.fr,
+            to: mv.to,
+            move_time_ms: 0,
+        });
+        self.gs.board = nb;
+        self.gs.turn = next;
+        self.gs.ep = ne;
+        self.gs.cast = nc;
+        self.gs.status = new_s;
+        if next == Color::White { self.gs.fullmove += 1; }
+        self.replay_snaps.push(ReplaySnap {
+            board: self.gs.board, turn: next,
+            notation: format!("{san}{sfx}"),
+            mv_num: self.gs.fullmove,
+        });
+        true
+    }
+
+    fn apply_online_clocks(&mut self, state: &GameState) {
+        // Correspondence and unlimited games report 0/0; don't start a clock
+        // that would immediately flag.
+        if state.w_ms == 0 && state.b_ms == 0 {
+            self.gs.white_ms = None;
+            self.gs.black_ms = None;
+        } else {
+            self.gs.white_ms = Some(state.w_ms);
+            self.gs.black_ms = Some(state.b_ms);
+        }
+        self.last_tick = Instant::now();
+        self.gs.clock_state = if is_terminal_status(&state.status)
+            || self.gs.white_ms.is_none()
+        {
+            ClockState::Paused
+        } else {
+            ClockState::Running
+        };
+    }
+
+    fn sync_online_state(&mut self, state: GameState) {
+        let have = self.online_moves.len();
+        let prefix_ok = state.moves.len() >= have && state.moves[..have] == self.online_moves[..];
+        if prefix_ok {
+            let mut replayed = true;
+            for uci in &state.moves[have..] {
+                if !self.push_server_move(uci) {
+                    rlog!("[lichess] server move {uci} failed - resyncing from scratch");
+                    replayed = false;
+                    break;
+                }
+            }
+            if !replayed {
+                let base = self.online_base_fen.clone();
+                self.rebuild_online_board(&state.moves, &base);
+            }
+        } else {
+            // Divergence (takeback, failed optimistic move, reconnect).
+            let base = self.online_base_fen.clone();
+            self.rebuild_online_board(&state.moves, &base);
+        }
+        self.online_moves = state.moves.clone();
+        self.apply_online_clocks(&state);
+        if is_terminal_status(&state.status) && self.online_result.is_none() {
+            self.finish_online(&state);
+        } else if !is_terminal_status(&state.status) {
+            self.online_status = if self.gs.turn == self.player_color {
+                "Your move".to_string()
+            } else {
+                "Opponent's move".to_string()
+            };
+            self.handle_game_offers(&state);
+        }
+    }
+
+    /// Surface draw/takeback offers carried by `gameState`, and clear them
+    /// again once the offer is gone.
+    fn handle_game_offers(&mut self, state: &GameState) {
+        let me = self.player_color;
+        let opp_draw = if me == Color::White { state.b_draw_offer } else { state.w_draw_offer };
+        let my_draw  = if me == Color::White { state.w_draw_offer } else { state.b_draw_offer };
+        let opp_take = if me == Color::White { state.b_takeback } else { state.w_takeback };
+        let my_take  = if me == Color::White { state.w_takeback } else { state.b_takeback };
+
+        if opp_draw {
+            self.draw_offer = Some(me);
+            self.draw_offer_msg = Some("Opponent offers a draw".into());
+            self.online_status = "Opponent offers a draw - press d to accept".into();
+        } else {
+            self.draw_offer = None;
+            self.draw_offer_msg = None;
+            if my_draw {
+                self.online_status = "Draw offer sent...".into();
+            }
+        }
+        if opp_take {
+            self.online_status = "Opponent offers a takeback - press t to accept".into();
+        } else if my_take {
+            self.online_status = "Takeback offer sent...".into();
+        }
+    }
+
+    fn finish_online(&mut self, state: &GameState) {
+        // GameFull and StateSync can both report the terminal state.
+        if self.online_result.is_some() { return; }
+        let (status, end, tag, message) = online_outcome(state, self.player_color);
+        self.gs.status = status;
+        self.game_end = end;
+        self.gs.clock_state = ClockState::Paused;
+        self.pgn_result = Some(tag.to_string());
+        self.online_result = Some(message.clone());
+        self.online_status = format!("Game over: {}", status_label(&state.status));
+        self.draw_offer = None;
+        self.draw_offer_msg = None;
+        self.finish_game();
+        // `finish_game` derives a generic result line; prefer the server's.
+        self.replay_result = message;
+        if let Some(client) = &mut self.lichess {
+            client.stop_seek();
+            client.fetch_ongoing();
+        }
+    }
+
+    fn push_chat(&mut self, username: &str, text: &str) {
+        let mine = !username.is_empty() && username == self.player_name;
+        if mine {
+            if self.chat_messages.last().map(|m| m == &format!("You: {text}")).unwrap_or(false) {
+                return;
+            }
+            self.chat_messages.push(format!("You: {text}"));
+        } else {
+            let who = if username.is_empty() || username == "?" {
+                self.lichess_opponent.as_deref().unwrap_or("Opponent")
+            } else {
+                username
+            };
+            self.chat_messages.push(format!("{who}: {text}"));
+        }
+        if self.chat_messages.len() > 50 { self.chat_messages.remove(0); }
     }
 
     fn poll_analysis(&mut self) {
@@ -785,7 +1067,6 @@ impl App {
 
     // ── Clock ─────────────────────────────────────────────────────────────────
     fn tick_clock(&mut self) {
-        if self.screen == Screen::OnlineGame { return; }
         let now = Instant::now();
         let elapsed_ms = now.duration_since(self.last_tick).as_millis() as u64;
         self.last_tick = now;
@@ -804,9 +1085,16 @@ impl App {
             }
         };
         if flagged {
-            self.gs.clock_state = ClockState::Flagged;
-            self.game_end = GameEnd::Flag;
-            self.finish_game();
+            if self.screen == Screen::OnlineGame {
+                // The server is authoritative for time forfeits; show 0:00 and
+                // wait for the terminal gameState instead of ending locally.
+                self.gs.clock_state = ClockState::Paused;
+                self.online_status = "Time is up - waiting for the server...".into();
+            } else {
+                self.gs.clock_state = ClockState::Flagged;
+                self.game_end = GameEnd::Flag;
+                self.finish_game();
+            }
         }
     }
 
@@ -826,7 +1114,7 @@ impl App {
             self.auto_png_export();
         }
         if self.cfg.auto_save_game {
-            let result_str = match self.game_end {
+            let result_str = self.pgn_result.clone().unwrap_or_else(|| match self.game_end {
                 GameEnd::Flag => format!("{} wins on time", self.gs.turn.opp().name()),
                 GameEnd::Draw => "\u{bd}-\u{bd} Draw".to_string(),
                 GameEnd::Normal => match self.gs.status {
@@ -834,20 +1122,25 @@ impl App {
                     Status::Stalemate => "Stalemate".to_string(),
                     _ => String::new(),
                 }
-            };
+            });
             let moves: Vec<String> = self.gs.history.iter()
                 .map(|h| format!("{}{}{}{}",
                     (b'a' + h.from.1 as u8) as char, 8 - h.from.0,
                     (b'a' + h.to.1 as u8) as char, 8 - h.to.0))
                 .collect();
+            let tc = if self.online_tc_label.is_empty() {
+                self.cfg.time_control.short_label().to_string()
+            } else {
+                self.online_tc_label.clone()
+            };
             let save = crate::save::GameSave {
                 initial_fen: self.current_fen(),
                 moves,
                 white_name: if self.player_color == crate::engine::Color::White { self.player_name.clone() } else { self.lichess_opponent.clone().unwrap_or_else(|| "White".into()) },
                 black_name: if self.player_color == crate::engine::Color::Black { self.player_name.clone() } else { self.lichess_opponent.clone().unwrap_or_else(|| "Black".into()) },
-                time_control: self.cfg.time_control.short_label().into(),
+                time_control: tc,
                 result: result_str,
-                date: format!("{:?}", std::time::SystemTime::now()),
+                date: today_ymd(),
                 incomplete: false,
             };
             crate::save::auto_save_game(&save);
@@ -856,6 +1149,7 @@ impl App {
 
     /// Save current (possibly incomplete) game to the saves directory.
     pub fn save_incomplete_game(&mut self) {
+        if !self.cfg.auto_save_game { return; }
         let moves: Vec<String> = self.gs.history.iter()
             .map(|h| format!("{}{}{}{}",
                 (b'a' + h.from.1 as u8) as char, 8 - h.from.0,
@@ -864,11 +1158,11 @@ impl App {
         let save = crate::save::GameSave {
             initial_fen: self.current_fen(),
             moves,
-            white_name: self.player_name.clone(),
-            black_name: self.lichess_opponent.clone().unwrap_or_else(|| "Opponent".into()),
-            time_control: self.cfg.time_control.short_label().into(),
+            white_name: if self.player_color == crate::engine::Color::White { self.player_name.clone() } else { self.lichess_opponent.clone().unwrap_or_else(|| "White".into()) },
+            black_name: if self.player_color == crate::engine::Color::Black { self.player_name.clone() } else { self.lichess_opponent.clone().unwrap_or_else(|| "Black".into()) },
+            time_control: if self.online_tc_label.is_empty() { self.cfg.time_control.short_label().into() } else { self.online_tc_label.clone() },
             result: "*".into(),
-            date: format!("{:?}", std::time::SystemTime::now()),
+            date: today_ymd(),
             incomplete: true,
         };
         crate::save::auto_save_game(&save);
@@ -905,25 +1199,23 @@ impl App {
 
     // ── PGN export ────────────────────────────────────────────────────────────
     pub fn export_pgn(&mut self) {
-        let result_tag = match self.game_end {
-            GameEnd::Flag => match self.gs.turn.opp() {
-                Color::White => "1-0", Color::Black => "0-1",
-            },
-            GameEnd::Draw => "1/2-1/2",
-            GameEnd::Normal => match self.gs.status {
-                Status::Checkmate => match self.gs.turn.opp() {
+        let result_tag = match self.pgn_result.clone() {
+            Some(tag) => tag,
+            None => match self.game_end {
+                GameEnd::Flag => match self.gs.turn.opp() {
                     Color::White => "1-0", Color::Black => "0-1",
+                }.to_string(),
+                GameEnd::Draw => "1/2-1/2".to_string(),
+                GameEnd::Normal => match self.gs.status {
+                    Status::Checkmate => match self.gs.turn.opp() {
+                        Color::White => "1-0", Color::Black => "0-1",
+                    }.to_string(),
+                    Status::Stalemate => "1/2-1/2".to_string(),
+                    _ => "*".to_string(),
                 },
-                Status::Stalemate => "1/2-1/2",
-                _ => "*",
-            }
+            },
         };
-        let date = {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let secs = SystemTime::now().duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs()).unwrap_or(0);
-            format!("{}.??.??", 1970 + secs / 86400 / 365)
-        };
+        let date = today_ymd();
         let is_online = self.lichess.is_some();
         let player_name = if is_online { self.player_name.clone() } else { "Player".to_string() };
         let opp_name = self.lichess_opponent.clone().unwrap_or_else(|| "Opponent".to_string());
@@ -959,10 +1251,20 @@ impl App {
                              },
             }
         };
-        let tc_str = match self.cfg.time_control {
-            TimeControl::Infinite => "-", TimeControl::Bullet => "60",
-            TimeControl::Blitz => "180",  TimeControl::Rapid => "600",
-            TimeControl::Classical => "1800",
+        let tc_str = if is_online && !self.online_tc_label.is_empty() {
+            self.online_tc_label.clone()
+        } else {
+            match self.cfg.time_control {
+                TimeControl::Infinite => "-", TimeControl::Bullet => "60",
+                TimeControl::Blitz => "180",  TimeControl::Rapid => "600",
+                TimeControl::Classical => "1800",
+            }.to_string()
+        };
+        let (event, site) = if is_online {
+            let site = format!("https://lichess.org/{}", self.lichess_game_id.clone().unwrap_or_default());
+            ("Lichess game", site)
+        } else {
+            ("RChess TUI", "Terminal".to_string())
         };
         let mut move_text = String::new();
         let h = &self.gs.history;
@@ -973,9 +1275,9 @@ impl App {
             i += 2; n += 1;
             if n.is_multiple_of(5) { move_text.push('\n'); }
         }
-        move_text.push_str(result_tag);
+        move_text.push_str(&result_tag);
         let pgn = format!(
-            "[Event \"RChess TUI\"]\n[Site \"Terminal\"]\n[Date \"{}\"]\n\
+            "[Event \"{event}\"]\n[Site \"{site}\"]\n[Date \"{}\"]\n\
              [White \"{}\"]\n[Black \"{}\"]\n[Result \"{}\"]\n\
              [TimeControl \"{}\"]\n[Generator \"RChess TUI v{}\"]\n\n{}\n",
             date, white_name, black_name, result_tag, tc_str, VERSION, move_text
@@ -1072,9 +1374,9 @@ impl App {
                         self.load_saved_game(path, save);
                     }
                 }
-                1 => { self.mode = Mode::PvP; self.player_color = Color::White; self.start_game(); }
+                1 => { self.clear_online_state(); self.mode = Mode::PvP; self.player_color = Color::White; self.start_game(); }
                 2 => { self.mode = Mode::Cpu; self.screen = Screen::ColorPick; }
-                3 => self.screen = Screen::OnlineLobby,
+                3 => self.open_online_lobby(),
                 4 => { self.prev_screen = Screen::Menu; self.screen = Screen::Settings; }
                 5 => self.open_import(),
                 6 => self.open_load_game(),
@@ -1092,26 +1394,48 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Up   | KeyCode::Char('k') => self.color_cur = 0,
             KeyCode::Right| KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => self.color_cur = 1,
             KeyCode::Enter | KeyCode::Char(' ') => {
+                self.clear_online_state();
                 self.player_color = if self.color_cur == 0 { Color::White } else { Color::Black };
                 self.start_game();
             }
-            KeyCode::Char('w') => { self.player_color = Color::White; self.start_game(); }
-            KeyCode::Char('b') => { self.player_color = Color::Black; self.start_game(); }
+            KeyCode::Char('w') => { self.clear_online_state(); self.player_color = Color::White; self.start_game(); }
+            KeyCode::Char('b') => { self.clear_online_state(); self.player_color = Color::Black; self.start_game(); }
             KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Menu,
             _ => {}
         }
     }
 
     pub fn handle_settings_key(&mut self, code: KeyCode) {
+        // Inline Lichess-token editor
+        if self.token_edit {
+            match code {
+                KeyCode::Esc => {
+                    self.token_edit = false;
+                    self.token_buf.clear();
+                    self.token_err = None;
+                }
+                KeyCode::Enter => self.commit_token(),
+                KeyCode::Backspace => { self.token_buf.pop(); self.token_err = None; }
+                KeyCode::Char(c) if c.is_ascii_graphic() => {
+                    self.token_buf.push(c);
+                    self.token_err = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let last = Setting::ALL.len().saturating_sub(1);
         match code {
-            KeyCode::Up   | KeyCode::Char('k') => { if self.settings_cur > 0  { self.settings_cur -= 1; } }
-            KeyCode::Down | KeyCode::Char('j') => { if self.settings_cur < 18 { self.settings_cur += 1; } }
+            KeyCode::Up   | KeyCode::Char('k') => { self.settings_cur = self.settings_cur.saturating_sub(1); }
+            KeyCode::Down | KeyCode::Char('j') => { if self.settings_cur < last { self.settings_cur += 1; } }
             KeyCode::PageUp   => { self.settings_cur = self.settings_cur.saturating_sub(5); }
-            KeyCode::PageDown => { self.settings_cur = (self.settings_cur + 5).min(18); }
+            KeyCode::PageDown => { self.settings_cur = (self.settings_cur + 5).min(last); }
             KeyCode::Home     => { self.settings_cur = 0; }
-            KeyCode::End      => { self.settings_cur = 18; }
-            KeyCode::Left | KeyCode::Char('h') => self.settings_cycle(false),
-            KeyCode::Right| KeyCode::Char('l') => self.settings_cycle(true),
+            KeyCode::End      => { self.settings_cur = last; }
+            KeyCode::Left | KeyCode::Char('h')  => self.activate_setting(false),
+            KeyCode::Right | KeyCode::Char('l') => self.activate_setting(true),
+            KeyCode::Enter => self.activate_setting(true),
             KeyCode::Char('w') | KeyCode::Char('s') => { self.cfg.save(); self.saved_notice = Some(120); }
             KeyCode::Char('r') => self.cfg = Config::default(),
             KeyCode::Esc | KeyCode::Char('q') => self.screen = self.prev_screen,
@@ -1119,62 +1443,112 @@ impl App {
         }
     }
 
-    fn settings_cycle(&mut self, fwd: bool) {
+    /// Cycle the highlighted setting, or open the text editor for token rows.
+    fn activate_setting(&mut self, fwd: bool) {
+        let Some(&setting) = Setting::ALL.get(self.settings_cur) else { return; };
+        if setting.is_text() {
+            self.token_edit = true;
+            self.token_buf.clear();
+            self.token_err = None;
+            self.online_status = "Paste a Lichess token, Enter to save, Esc to cancel".into();
+            return;
+        }
+        self.settings_cycle(setting, fwd);
+    }
+
+    fn commit_token(&mut self) {
+        let token = self.token_buf.trim().to_string();
+        if token.is_empty() {
+            self.token_err = Some("Token is empty".into());
+            return;
+        }
+        if !token.starts_with("lip_") && token.len() < 20 {
+            self.token_err = Some("Lichess tokens start with lip_".into());
+            return;
+        }
+        self.cfg.lichess_token = token;
+        self.cfg.save();
+        self.saved_notice = Some(120);
+        self.token_edit = false;
+        self.token_buf.clear();
+        self.token_err = None;
+        // Force a clean reconnect with the new credentials.
+        self.lichess = None;
+        self.lichess_connected = false;
+        self.player_name = whoami();
+        self.online_status = "Token saved - connecting...".into();
+        self.connect_lichess();
+        // Re-attach to a game in progress so the board keeps updating.
+        if let Some(id) = self.lichess_game_id.clone() {
+            if let Some(client) = &mut self.lichess {
+                client.start_game_stream(&id);
+                client.fetch_ongoing();
+            }
+        }
+    }
+
+    fn settings_cycle(&mut self, setting: Setting, fwd: bool) {
         use crate::config::*;
         fn cyc<T: Copy + PartialEq>(arr: &[T], cur: T, fwd: bool) -> T {
             let i = arr.iter().position(|x| x == &cur).unwrap_or(0);
             if fwd { arr[(i + 1) % arr.len()] } else { arr[(i + arr.len() - 1) % arr.len()] }
         }
-        match self.settings_cur {
-            0  => self.cfg.theme           = cyc(Theme::ALL,          self.cfg.theme,           fwd),
-            1  => self.cfg.piece_style     = cyc(PieceStyle::ALL,     self.cfg.piece_style,     fwd),
-            2  => self.cfg.ai_depth        = cyc(AiDepth::ALL,        self.cfg.ai_depth,        fwd),
-            3  => self.cfg.move_hints      = cyc(MoveHints::ALL,      self.cfg.move_hints,      fwd),
-            4  => self.cfg.time_control    = cyc(TimeControl::ALL,    self.cfg.time_control,    fwd),
-            5  => self.cfg.show_coords     = !self.cfg.show_coords,
-            6  => self.cfg.show_clock      = !self.cfg.show_clock,
-            7  => self.cfg.flip_board      = !self.cfg.flip_board,
-            8  => self.cfg.auto_flip       = !self.cfg.auto_flip,
-             9  => self.cfg.confirm_move    = !self.cfg.confirm_move,
-             10 => self.cfg.auto_promote     = !self.cfg.auto_promote,
-             11 => self.cfg.ui_mode         = cyc(UiMode::ALL,         self.cfg.ui_mode,         fwd),
-             12 => {
+        match setting {
+            Setting::Theme          => self.cfg.theme = cyc(Theme::ALL, self.cfg.theme, fwd),
+            Setting::PieceStyle     => self.cfg.piece_style = cyc(PieceStyle::ALL, self.cfg.piece_style, fwd),
+            Setting::AiDepth        => self.cfg.ai_depth = cyc(AiDepth::ALL, self.cfg.ai_depth, fwd),
+            Setting::MoveHints      => self.cfg.move_hints = cyc(MoveHints::ALL, self.cfg.move_hints, fwd),
+            Setting::TimeControl    => self.cfg.time_control = cyc(TimeControl::ALL, self.cfg.time_control, fwd),
+            Setting::ShowCoords     => self.cfg.show_coords = !self.cfg.show_coords,
+            Setting::ShowClock      => self.cfg.show_clock = !self.cfg.show_clock,
+            Setting::FlipBoard      => self.cfg.flip_board = !self.cfg.flip_board,
+            Setting::AutoFlip       => self.cfg.auto_flip = !self.cfg.auto_flip,
+            Setting::ConfirmMove    => self.cfg.confirm_move = !self.cfg.confirm_move,
+            Setting::AutoPromote    => self.cfg.auto_promote = !self.cfg.auto_promote,
+            Setting::UiMode         => self.cfg.ui_mode = cyc(UiMode::ALL, self.cfg.ui_mode, fwd),
+            Setting::AnalysisEngine => {
                 self.cfg.analysis_engine = cyc(AnalysisEngine::ALL, self.cfg.analysis_engine, fwd);
                 self.restart_analysis_engine();
             }
-              13 => {
+            Setting::AnalysisDepth => {
                 self.cfg.analysis_depth = if fwd {
                     (self.cfg.analysis_depth % 3) + 1
-                } else {
-                    if self.cfg.analysis_depth <= 1 { 3 } else { self.cfg.analysis_depth - 1 }
-                };
+                } else if self.cfg.analysis_depth <= 1 { 3 } else { self.cfg.analysis_depth - 1 };
                 self.restart_analysis_engine();
             }
-              14 => self.cfg.auto_save_png   = !self.cfg.auto_save_png,
-              15 => self.cfg.auto_save_game  = !self.cfg.auto_save_game,
-               16 => {
-                let cur = self.cfg.highlight_brightness as i16;
-                self.cfg.highlight_brightness = if fwd { (cur + 1).min(10) as u8 } else { (cur - 1).max(0) as u8 };
-            }
-               17 => {
-                self.cfg.tty_mode = !self.cfg.tty_mode;
-                let tty_auto = std::env::var("TERM").unwrap_or_default();
-                let tty_auto = tty_auto == "linux" || tty_auto == "vt100" || tty_auto == "vt220"
-                    || tty_auto.starts_with("screen") || tty_auto == "dumb";
-                crate::ui::TTY_MODE.store(self.cfg.tty_mode || tty_auto, std::sync::atomic::Ordering::Relaxed);
-            }
-              18 => {
+            Setting::StockfishSkill => {
                 let cur = self.cfg.stockfish_skill as i16;
                 self.cfg.stockfish_skill = if fwd { (cur + 1).min(20) as u8 } else { (cur - 1).max(0) as u8 };
             }
-            _  => {}
+            Setting::AutoSavePng    => self.cfg.auto_save_png = !self.cfg.auto_save_png,
+            Setting::AutoSaveGame   => self.cfg.auto_save_game = !self.cfg.auto_save_game,
+            Setting::HighlightBrightness => {
+                let cur = self.cfg.highlight_brightness as i16;
+                self.cfg.highlight_brightness = if fwd { (cur + 1).min(10) as u8 } else { (cur - 1).max(0) as u8 };
+            }
+            Setting::TtyMode => {
+                self.cfg.tty_mode = !self.cfg.tty_mode;
+                let term = std::env::var("TERM").unwrap_or_default();
+                let auto = term == "linux" || term == "vt100" || term == "vt220"
+                    || term.starts_with("screen") || term == "dumb";
+                crate::ui::TTY_MODE.store(self.cfg.tty_mode || auto, std::sync::atomic::Ordering::Relaxed);
+            }
+            Setting::LichessToken => {}
         }
     }
 
     pub fn handle_game_key(&mut self, code: KeyCode) {
         let over  = matches!(self.gs.status, Status::Checkmate | Status::Stalemate | Status::Draw)
                     || self.gs.clock_state == ClockState::Flagged;
-        let human = self.mode == Mode::PvP || self.gs.turn == self.player_color;
+        let human = if self.screen == Screen::OnlineGame {
+            // Never move for the opponent, and never move after the game ended.
+            self.gs.turn == self.player_color
+                && !over
+                && matches!(self.gs.status, Status::Active | Status::Check)
+                && self.online_result.is_none()
+        } else {
+            self.mode == Mode::PvP || self.gs.turn == self.player_color
+        };
 
         // Typing mode — keys go into notation buffer
         if !self.input_buf.is_empty() {
@@ -1214,7 +1588,13 @@ impl App {
                 }
                 self.screen = Screen::Menu; self.selected = None; self.targets = vec![];
             }
-            KeyCode::Char('n') => self.start_game(),
+            KeyCode::Char('n') => {
+                if self.lichess_game_id.is_some() {
+                    self.online_status = "Leave the online game first (q), then start a new one".into();
+                } else {
+                    self.start_game();
+                }
+            }
             KeyCode::Char('s') => { self.prev_screen = self.screen; self.screen = Screen::Settings; }
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char('r') => {
@@ -1417,8 +1797,9 @@ impl App {
     pub fn handle_mouse_scroll(&mut self, dir: i8) {
         match self.screen {
             Screen::Settings => {
+                let last = Setting::ALL.len().saturating_sub(1);
                 if dir < 0 { if self.settings_cur > 0 { self.settings_cur -= 1; } }
-                else { if self.settings_cur < 18 { self.settings_cur += 1; } }
+                else { if self.settings_cur < last { self.settings_cur += 1; } }
             }
             Screen::Menu => {
                 if dir < 0 { if self.menu_cur > 0 { self.menu_cur -= 1; } }
@@ -1438,6 +1819,13 @@ impl App {
 
     // ── Selection ─────────────────────────────────────────────────────────────
     fn do_select(&mut self, bc: (usize, usize)) {
+        // Online games only accept input from the side the user controls.
+        if self.screen == Screen::OnlineGame {
+            let playable = matches!(self.gs.status, Status::Active | Status::Check);
+            if self.gs.turn != self.player_color || !playable || self.online_result.is_some() {
+                return;
+            }
+        }
         let piece = self.gs.board[bc.0][bc.1];
         if let Some(sel) = self.selected {
             if self.targets.iter().any(|m| m.fr == sel && m.to == bc) {
@@ -1632,21 +2020,36 @@ impl App {
             self.finish_game();
         }
 
-        // Forward move to opponent via Lichess API (only if we moved, not the opponent)
-        if self.screen == Screen::OnlineGame && piece.c == self.player_color {
+        // Forward our move to Lichess. Moves replayed from the server go
+        // through `push_server_move` and never reach this path.
+        if self.screen == Screen::OnlineGame
+            && piece.c == self.player_color
+            && self.lichess_game_id.is_some()
+        {
+            let mut sent = false;
+            let mut err  = None;
             if let Some(client) = &self.lichess {
                 if let Some(ref id) = self.lichess_game_id {
-                    let uci = &*uci_note;
-                    rlog!("[lichess] sending move: {uci}");
-                    if let Err(e) = client.play_move(id, uci) {
-                        rlog!("[lichess] send move error: {e}");
-                        self.online_status = format!("Move error: {e} — undoing");
-                        // Rollback: restore previous state
-                        if let Some((prev_gs, prev_cx, prev_cy)) = self.undo_stack.pop() {
-                            self.gs = prev_gs;
-                            self.cursor = (prev_cx, prev_cy);
-                        }
+                    rlog!("[lichess] sending move: {uci_note}");
+                    match client.play_move(id, &uci_note) {
+                        Ok(())  => sent = true,
+                        Err(e)  => err = Some(e),
                     }
+                }
+            }
+            if sent {
+                self.online_moves.push(uci_note.clone());
+                self.online_status = "Move sent".into();
+            } else if let Some(e) = err {
+                rlog!("[lichess] send move error: {e}");
+                self.online_status = format!("Move rejected: {e} - rolling back");
+                if let Some((prev_gs, prev_cx, prev_cy)) = self.undo_stack.pop() {
+                    self.gs = prev_gs;
+                    self.cursor = (prev_cx, prev_cy);
+                    let keep = self.gs.history.len() + 1;
+                    self.replay_snaps.truncate(keep);
+                    self.move_reviews.truncate(self.gs.history.len());
+                    self.eval_history.truncate(keep);
                 }
             }
         }
@@ -1660,6 +2063,7 @@ impl App {
     }
 
     pub fn load_saved_game(&mut self, _path: std::path::PathBuf, save: crate::save::GameSave) {
+        self.clear_online_state();
         self.start_game();
         self.gs.history.clear();
         self.replay_snaps.clear();
@@ -1754,6 +2158,7 @@ impl App {
     fn apply_fen(&mut self, board: crate::engine::Board, turn: crate::engine::Color,
         ep: Option<(usize, usize)>, cast: crate::engine::Castle, fullmove: u32)
     {
+        self.clear_online_state();
         self.gs = Gs::new(self.cfg.time_control);
         self.gs.board    = board;
         self.gs.turn     = turn;
@@ -1778,6 +2183,7 @@ impl App {
 
     /// Load a PGN game (by text or file path) and open analyze.
     fn load_pgn(&mut self, game: crate::pgn_import::PgnGame) {
+        self.clear_online_state();
         self.mode = Mode::PvP;
         self.player_color = Color::White;
         self.start_game();
@@ -1795,6 +2201,7 @@ impl App {
 
     // ── Puzzle ────────────────────────────────────────────────────────────────
     pub fn open_puzzle(&mut self) {
+        self.clear_online_state();
         self.puzzle       = None;
         self.puzzle_state = crate::puzzle::PuzzleState::Loading;
         self.puzzle_move_idx = 0;
@@ -1840,22 +2247,114 @@ impl App {
     }
 
     pub fn poll_online(&mut self) {
-        if let Some(client) = &mut self.lichess {
-            client.poll_username();
-            if client.connected && !self.lichess_connected {
-                self.player_name = client.username.clone();
-                self.cfg.lichess_username = client.username.clone();
-                self.lichess_connected = true;
-                self.online_status = "Connected to Lichess".into();
-            } else if !client.connected && client.username.is_empty() {
-                // still waiting
-            } else if !client.connected && !client.username.is_empty() && client.username != "?" {
-                self.lichess_connected = true;
-                self.player_name = client.username.clone();
-                self.cfg.lichess_username = client.username.clone();
-                self.online_status = "Connected to Lichess".into();
+        let mut connect_error: Option<String> = None;
+        let mut seek_event = None;
+        if self.lichess.is_none() {
+            self.lichess_connected = false;
+            return;
+        }
+        {
+            let client = self.lichess.as_mut().unwrap();
+            let was_connected = client.connected;
+            client.poll_account();
+            client.poll_games();
+            seek_event = client.poll_seek();
+            let connected = client.connected;
+            let username = client.username.clone();
+            let account  = client.account.clone();
+            connect_error = client.username_error.take();
+            self.online_games = client.games.clone();
+            self.lichess_connected = connected;
+            if connected && !was_connected {
+                if !username.is_empty() {
+                    self.player_name = username.clone();
+                    self.cfg.lichess_username = username;
+                }
+                let rating = account
+                    .and_then(|a| a.rating)
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default();
+                self.online_status = format!("Connected as {}{rating}", self.player_name);
             }
         }
+        if let Some(err) = connect_error {
+            self.online_status = format!("Lichess: {err}");
+            // Bad credentials are permanent until the user reconnects.
+            if err.contains("401") || err.contains("403") || err.contains("No such token") {
+                self.lichess = None;
+                self.lichess_connected = false;
+            }
+        }
+        if let Some(result) = seek_event {
+            match result {
+                Ok(()) => {
+                    self.online_seeking = true;
+                    self.online_seek_at = Some(Instant::now());
+                    self.online_status = "Searching for an opponent...".into();
+                }
+                Err(e) => {
+                    self.online_seeking = false;
+                    self.online_seek_at = None;
+                    self.online_status = format!("Seek failed: {e}");
+                }
+            }
+        }
+        // The response stream is never read, so expire the seek locally as a
+        // backstop in case the server closes it without sending a game.
+        if self.online_seeking {
+            if let Some(at) = self.online_seek_at {
+                if at.elapsed() > Duration::from_secs(300) {
+                    if let Some(client) = &mut self.lichess {
+                        client.stop_seek();
+                    }
+                    self.online_seeking = false;
+                    self.online_seek_at = None;
+                    self.online_status = "Seek expired - press p to try again".into();
+                }
+            }
+        }
+    }
+
+    /// Create a fresh client for the configured token (drops the old streams).
+    pub fn connect_lichess(&mut self) {
+        self.lichess = None;
+        self.online_seeking = false;
+        self.online_seek_at = None;
+        if !self.cfg.has_lichess_token() {
+            self.lichess_connected = false;
+            self.online_status = "No Lichess token - press s to add one".into();
+            return;
+        }
+        self.lichess = Some(LichessNetClient::new(&self.cfg.lichess_token));
+        self.lichess_connected = false;
+        self.online_status = "Connecting to Lichess...".into();
+    }
+
+    /// True while a text field owns the keyboard, so global shortcuts such as
+    /// `?` must not fire.
+    pub fn text_input_active(&self) -> bool {
+        self.token_edit || self.challenge_mode || self.online_chat_mode
+    }
+
+    pub fn open_online_lobby(&mut self) {
+        self.screen = Screen::OnlineLobby;
+        self.challenge_cur = 0;
+        self.online_result = None;
+        self.token_edit = false;
+        self.token_err = None;
+        self.connect_lichess();
+    }
+
+    /// Resume one of the games listed by `/api/account/playing`.
+    fn resume_online_game(&mut self, idx: usize) {
+        let Some(game) = self.online_games.get(idx).cloned() else { return; };
+        self.begin_online_game(
+            game.game_id,
+            game.opponent,
+            game.opponent_rating,
+            game.color,
+        );
+        self.online_status = format!("Resuming {} game...", game.speed);
     }
 
     fn setup_puzzle(&mut self, p: crate::puzzle::Puzzle) {
@@ -2189,27 +2688,6 @@ pub fn parse_notation(
 
 impl App {
     pub fn handle_online_lobby_key(&mut self, code: KeyCode) {
-        // Auto-connect if token is set
-        if self.lichess.is_none() && !self.cfg.lichess_token.is_empty() {
-            let client = LichessNetClient::new(&self.cfg.lichess_token);
-            self.lichess = Some(client);
-            self.lichess_connected = false;
-            self.online_status = "Connecting...".into();
-        }
-
-        // Poll for async username fetch
-        if let Some(client) = &mut self.lichess {
-            client.poll_username();
-            if !client.connected && client.username.is_empty() {
-                // still waiting
-            } else if !self.lichess_connected {
-                self.player_name = client.username.clone();
-                self.cfg.lichess_username = client.username.clone();
-                self.lichess_connected = true;
-                self.online_status = "Connected to Lichess".into();
-            }
-        }
-
         if self.challenge_mode {
             match code {
                 KeyCode::Esc => { self.challenge_mode = false; self.challenge_buf.clear(); }
@@ -2217,20 +2695,19 @@ impl App {
                     self.challenge_buf.push(c);
                 }
                 KeyCode::Backspace => { self.challenge_buf.pop(); }
-                KeyCode::Enter
-                    if !self.challenge_buf.is_empty() => {
-                        if let Some(client) = &self.lichess {
-                            let uname = self.challenge_buf.clone();
-                            let tcs = [(10u32, 0u32), (5u32, 5u32), (15u32, 10u32), (30u32, 0u32)];
-                            let (limit, inc) = tcs[self.online_tc_idx.min(tcs.len() - 1)];
-                            match client.challenge_user(&uname, self.online_rated, limit, inc) {
-                                Ok(()) => self.online_status = format!("Challenge sent to {uname}"),
-                                Err(e) => self.online_status = format!("Challenge failed: {e}"),
-                            }
-                        }
-                        self.challenge_buf.clear();
-                        self.challenge_mode = false;
-                    }
+                KeyCode::Enter if !self.challenge_buf.is_empty() => {
+                    let uname = self.challenge_buf.trim().to_string();
+                    let (limit, inc) = ONLINE_TCS[self.online_tc_idx.min(ONLINE_TCS.len() - 1)].1;
+                    let result = self.lichess.as_ref().map(|c|
+                        c.challenge_user(&uname, self.online_rated, limit, inc));
+                    self.online_status = match result {
+                        Some(Ok(()))  => format!("Challenge sent to {uname}"),
+                        Some(Err(e))  => format!("Challenge failed: {e}"),
+                        None          => "Not connected to Lichess".into(),
+                    };
+                    self.challenge_buf.clear();
+                    self.challenge_mode = false;
+                }
                 _ => {}
             }
             return;
@@ -2239,64 +2716,64 @@ impl App {
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 if self.online_seeking {
-                    if let Some(client) = &self.lichess {
-                        if let Err(e) = client.cancel_seek() {
-                            rlog!("[lichess] cancel seek error: {e}");
-                        }
+                    if let Some(client) = &mut self.lichess {
+                        client.stop_seek();
                     }
                 }
                 self.online_seeking = false;
+                self.online_seek_at = None;
+                // Drop the event stream so a challenge cannot pull the user
+                // into a game from the main menu.
+                self.lichess = None;
+                self.lichess_connected = false;
                 self.screen = Screen::Menu;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.challenge_cur = self.challenge_cur.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.challenge_cur + 1 < self.lichess_challenges.len() {
+                    self.challenge_cur += 1;
+                }
+            }
+            KeyCode::Char('a') => self.accept_selected_challenge(),
+            KeyCode::Char('d') => self.decline_selected_challenge(),
+            // Digits resume an ongoing game from the list.
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = c as usize - '1' as usize;
+                if idx < self.online_games.len() {
+                    self.resume_online_game(idx);
+                }
+            }
+            KeyCode::Enter => {
+                if !self.lichess_challenges.is_empty() {
+                    self.accept_selected_challenge();
+                } else if !self.online_games.is_empty() {
+                    self.resume_online_game(0);
+                }
             }
             KeyCode::Char('c') => {
                 if self.lichess.is_some() {
                     self.challenge_mode = true;
                     self.challenge_buf.clear();
                     self.online_status = "Type opponent username, Enter to challenge".into();
+                } else if self.cfg.has_lichess_token() {
+                    self.online_status = "Not connected - press R to reconnect".into();
                 } else {
-                    self.online_status = "Set lichess_token in Settings first".into();
-                }
-            }
-            KeyCode::Char('a') => {
-                // Accept the first challenge in the list
-                if let Some(ch) = self.lichess_challenges.first() {
-                    let cid = ch.id.clone();
-                    if let Some(client) = &self.lichess {
-                        match client.accept_challenge(&cid) {
-                            Ok(()) => self.online_status = "Challenge accepted!".into(),
-                            Err(e) => self.online_status = format!("Accept failed: {e}"),
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('d') => {
-                // Decline the first challenge
-                if let Some(ch) = self.lichess_challenges.first() {
-                    let cid = ch.id.clone();
-                    if let Some(client) = &self.lichess {
-                        if let Err(e) = client.decline_challenge(&cid) {
-                            rlog!("[lichess] decline challenge error: {e}");
-                            self.online_status = format!("Decline failed: {e}");
-                        }
-                    }
-                    self.lichess_challenges.remove(0);
+                    self.online_status = "Add a Lichess token in Settings first".into();
                 }
             }
             KeyCode::Char('p') => {
-                // Play random: create a lobby seek
-                if let Some(client) = &self.lichess {
-                    let tcs = [("10+0", 10u32, 0u32), ("5+5", 5u32, 5u32),
-                               ("15+10", 15u32, 10u32), ("30+0", 30u32, 0u32)];
-                    let (_, limit, inc) = tcs[self.online_tc_idx.min(tcs.len() - 1)];
-                    match client.create_seek(self.online_rated, limit, inc) {
-                        Ok(()) => {
-                            self.online_seeking = true;
-                            self.online_status = format!("Seeking {} {}+{} game...", if self.online_rated { "rated" } else { "casual" }, limit, inc);
-                        }
-                        Err(e) => self.online_status = format!("Seek failed: {e}"),
-                    }
+                let (_, (limit, inc)) = ONLINE_TCS[self.online_tc_idx.min(ONLINE_TCS.len() - 1)];
+                if let Some(client) = &mut self.lichess {
+                    client.start_seek(self.online_rated, limit, inc);
+                    self.online_seeking = true;
+                    self.online_seek_at = None;
+                    self.online_status = format!(
+                        "Seeking {} {}+{} game... (Esc to cancel)",
+                        if self.online_rated { "rated" } else { "casual" }, limit, inc);
                 } else {
-                    self.online_status = "Set lichess_token in Settings first".into();
+                    self.online_status = "Not connected - press R to reconnect".into();
                 }
             }
             KeyCode::Char('r') => {
@@ -2304,21 +2781,57 @@ impl App {
                 self.online_status = if self.online_rated { "Rated games".into() } else { "Casual games".into() };
             }
             KeyCode::Char('t') => {
-                let tcs = ["10+0", "5+5", "15+10", "30+0"];
-                self.online_tc_idx = (self.online_tc_idx + 1) % tcs.len();
-                self.online_status = format!("Time control: {}", tcs[self.online_tc_idx]);
+                self.online_tc_idx = (self.online_tc_idx + 1) % ONLINE_TCS.len();
+                self.online_status = format!("Time control: {}", ONLINE_TCS[self.online_tc_idx].0);
+            }
+            KeyCode::Char('R') => {
+                self.connect_lichess();
+                self.online_status = "Reconnecting to Lichess...".into();
             }
             KeyCode::Char('s') => {
                 self.prev_screen = self.screen;
                 self.screen = Screen::Settings;
             }
-            KeyCode::Up => {
-                if self.menu_cur > 0 { self.menu_cur -= 1; }
-            }
-            KeyCode::Down
-                if self.menu_cur < 10 => { self.menu_cur += 1; }
             _ => {}
         }
+    }
+
+    fn accept_selected_challenge(&mut self) {
+        let Some(ch) = self.lichess_challenges.get(self.challenge_cur) else { return; };
+        // The board model is standard chess; never start a variant we cannot
+        // represent correctly. Challenge variants are display names.
+        let variant = ch.variant.to_ascii_lowercase();
+        if variant != "standard" && variant != "from position" {
+            self.online_status = format!(
+                "{} games are not supported (standard chess only)", ch.variant
+            );
+            return;
+        }
+        let cid = ch.id.clone();
+        let name = ch.challenger_name.clone();
+        let result = self.lichess.as_ref().map(|c| c.accept_challenge(&cid));
+        match result {
+            Some(Ok(())) => {
+                self.lichess_challenges.retain(|c| c.id != cid);
+                self.challenge_cur = self.challenge_cur.min(self.lichess_challenges.len().saturating_sub(1));
+                self.online_status = format!("Accepted challenge from {name}");
+            }
+            Some(Err(e)) => self.online_status = format!("Accept failed: {e}"),
+            None => {}
+        }
+    }
+
+    fn decline_selected_challenge(&mut self) {
+        let Some(ch) = self.lichess_challenges.get(self.challenge_cur) else { return; };
+        let cid = ch.id.clone();
+        if let Some(client) = &self.lichess {
+            if let Err(e) = client.decline_challenge(&cid) {
+                rlog!("[lichess] decline challenge error: {e}");
+                self.online_status = format!("Decline failed: {e}");
+            }
+        }
+        self.lichess_challenges.retain(|c| c.id != cid);
+        self.challenge_cur = self.challenge_cur.min(self.lichess_challenges.len().saturating_sub(1));
     }
 
     /// Repurposed: handle online game screen input
@@ -2332,19 +2845,26 @@ impl App {
                 KeyCode::Enter => {
                     if !self.chat_buf.is_empty() {
                         let msg = self.chat_buf.clone();
+                        let mut send_err = None;
                         if let Some(client) = &self.lichess {
                             if let Some(ref id) = self.lichess_game_id {
                                 if let Err(e) = client.chat(id, "player", &msg) {
                                     rlog!("[lichess] chat error: {e}");
+                                    send_err = Some(e);
                                 }
                             }
                         }
-                        self.chat_messages.push(format!("You: {msg}"));
-                        if self.chat_messages.len() > 50 { self.chat_messages.remove(0); }
+                        match send_err {
+                            Some(e) => self.online_status = format!("Chat failed: {e}"),
+                            None => {
+                                self.chat_messages.push(format!("You: {msg}"));
+                                if self.chat_messages.len() > 50 { self.chat_messages.remove(0); }
+                                self.online_status = "Chat sent".into();
+                            }
+                        }
                         self.chat_buf.clear();
                     }
                     self.online_chat_mode = false;
-                    self.online_status = "Chat sent".into();
                 }
                 _ => {}
             }
@@ -2353,13 +2873,31 @@ impl App {
 
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                if !matches!(self.gs.status, Status::Checkmate | Status::Stalemate | Status::Draw) {
+                if self.online_result.is_none()
+                    && !matches!(self.gs.status, Status::Checkmate | Status::Stalemate | Status::Draw)
+                {
                     self.save_incomplete_game();
                 }
                 if let Some(client) = &mut self.lichess {
                     client.stop_game_stream();
+                    client.stop_seek();
+                }
+                self.lichess_game_id = None;
+                self.online_seeking = false;
+                self.online_seek_at = None;
+                self.online_moves.clear();
+                self.online_result = None;
+                self.online_status = "Left the game - find it under ongoing games".into();
+                if let Some(client) = &mut self.lichess {
+                    client.fetch_ongoing();
                 }
                 self.screen = Screen::OnlineLobby;
+            }
+            KeyCode::Char('R') => {
+                if let (Some(client), Some(id)) = (&mut self.lichess, self.lichess_game_id.clone()) {
+                    client.start_game_stream(&id);
+                    self.online_status = "Resyncing with Lichess...".into();
+                }
             }
             KeyCode::Char('s') => {
                 self.prev_screen = self.screen;
@@ -2371,10 +2909,7 @@ impl App {
                 } else if let Some(client) = &self.lichess {
                     if let Some(ref id) = self.lichess_game_id {
                         match client.abort_game(id) {
-                            Ok(()) => {
-                                self.online_status = "Game aborted".into();
-                                self.screen = Screen::OnlineLobby;
-                            }
+                            Ok(()) => self.online_status = "Abort requested...".into(),
                             Err(e) => {
                                 self.online_status = format!("Abort failed: {e}");
                                 rlog!("[lichess] abort error: {e}");
@@ -2393,13 +2928,32 @@ impl App {
                     self.online_status = "Draw: not connected to a game".into();
                 } else if let Some(client) = &self.lichess {
                     if let Some(ref id) = self.lichess_game_id {
+                        // `yes` both offers and accepts a draw in the Board API.
                         match client.offer_draw(id, true) {
-                            Ok(()) => self.online_status = "Draw offered".into(),
+                            Ok(()) => {
+                                self.online_status = if self.draw_offer.is_some() {
+                                    "Draw accepted".into()
+                                } else {
+                                    "Draw offered".into()
+                                };
+                                self.draw_offer = None;
+                            }
                             Err(e) => {
                                 self.online_status = format!("Draw offer failed: {e}");
                                 rlog!("[lichess] draw error: {e}");
                             }
                         }
+                    }
+                }
+            }
+            KeyCode::Char('D') => {
+                if let (Some(client), Some(id)) = (&self.lichess, self.lichess_game_id.clone()) {
+                    match client.offer_draw(&id, false) {
+                        Ok(()) => {
+                            self.online_status = "Draw declined".into();
+                            self.draw_offer = None;
+                        }
+                        Err(e) => self.online_status = format!("Decline failed: {e}"),
                     }
                 }
             }
@@ -2409,10 +2963,7 @@ impl App {
                 } else if let Some(client) = &self.lichess {
                     if let Some(ref id) = self.lichess_game_id {
                         match client.resign_game(id) {
-                            Ok(()) => {
-                                self.online_status = "You resigned".into();
-                                self.screen = Screen::OnlineLobby;
-                            }
+                            Ok(()) => self.online_status = "You resigned".into(),
                             Err(e) => {
                                 self.online_status = format!("Resign failed: {e}");
                                 rlog!("[lichess] resign error: {e}");
@@ -2457,6 +3008,67 @@ impl App {
             }
             _ => self.handle_game_key(code),
         }
+    }
+}
+
+/// Map a Lichess game status onto local board/game state.
+///
+/// The previous code treated every non-mate, non-draw result as *stalemate*,
+/// so resignations and time-outs showed "Game drawn - no legal moves".
+fn online_outcome(state: &GameState, me: Color) -> (Status, GameEnd, &'static str, String) {
+    let won = state.winner == Some(me);
+    let tag = match state.winner {
+        Some(Color::White) => "1-0",
+        Some(Color::Black) => "0-1",
+        None               => "*",
+    };
+    let win_text = |how: &str| if won { format!("You won by {how}") } else { format!("You lost by {how}") };
+    match state.status.as_str() {
+        "mate" => (Status::Checkmate, GameEnd::Normal, tag, win_text("checkmate")),
+        "resign" => (Status::Active, GameEnd::Normal, tag, win_text("resignation")),
+        "timeout" | "outoftime" => (Status::Active, GameEnd::Normal, tag, win_text("time out")),
+        "stalemate" => (Status::Stalemate, GameEnd::Draw, "1/2-1/2", "Draw by stalemate".into()),
+        "draw" => (Status::Draw, GameEnd::Draw, "1/2-1/2", "Draw".into()),
+        "aborted" => (Status::Active, GameEnd::Normal, "*", "Game aborted".into()),
+        "noStart" => (Status::Active, GameEnd::Normal, "*", "Game was not started".into()),
+        "cheat" => (Status::Active, GameEnd::Normal, "*", "Game cancelled (fair play)".into()),
+        "variantEnd" => (Status::Active, GameEnd::Normal, tag, "Variant game ended".into()),
+        _ => (Status::Active, GameEnd::Normal, tag, "Game finished".into()),
+    }
+}
+
+/// Today's date as `YYYY.MM.DD`, for PGN headers.
+fn today_ymd() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y}.{m:02}.{d:02}")
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "mate"        => "checkmate",
+        "resign"      => "resignation",
+        "timeout" | "outoftime" => "time out",
+        "draw"        => "draw",
+        "stalemate"   => "stalemate",
+        "aborted"     => "aborted",
+        "noStart"     => "not started",
+        "cheat"       => "cancelled",
+        "unknownFinish" | "variantEnd" => "finished",
+        _             => "over",
     }
 }
 
@@ -2539,4 +3151,62 @@ fn copy_to_clipboard(text: &str) -> bool {
             Ok(())
         }).is_ok() { return true; }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(status: &str, winner: Option<Color>) -> GameState {
+        GameState {
+            moves: vec![],
+            w_ms: 1_000,
+            b_ms: 1_000,
+            w_inc: 0,
+            b_inc: 0,
+            status: status.to_string(),
+            winner,
+            w_draw_offer: false,
+            b_draw_offer: false,
+            w_takeback: false,
+            b_takeback: false,
+        }
+    }
+
+    #[test]
+    fn resignation_is_not_reported_as_stalemate() {
+        let (status, end, tag, message) = online_outcome(&state("resign", Some(Color::Black)), Color::White);
+        assert_eq!(status, Status::Active);
+        assert_eq!(end, GameEnd::Normal);
+        assert_eq!(tag, "0-1");
+        assert!(message.contains("lost"));
+        assert!(!message.to_lowercase().contains("stalemate"));
+    }
+
+    #[test]
+    fn checkmate_keeps_checkmate_status() {
+        let (status, _, tag, message) = online_outcome(&state("mate", Some(Color::White)), Color::White);
+        assert_eq!(status, Status::Checkmate);
+        assert_eq!(tag, "1-0");
+        assert!(message.contains("won"));
+    }
+
+    #[test]
+    fn draw_and_abort_have_correct_pgn_tags() {
+        let (_, _, tag, _) = online_outcome(&state("draw", None), Color::Black);
+        assert_eq!(tag, "1/2-1/2");
+        let (_, _, tag, _) = online_outcome(&state("aborted", None), Color::Black);
+        assert_eq!(tag, "*");
+    }
+
+    #[test]
+    fn time_control_catalog_matches_lichess_seek_rules() {
+        // Lichess requires limit*60 + increment*40 > 300 for public seeks.
+        for (label, (limit, inc)) in ONLINE_TCS {
+            assert!(
+                *limit * 60 + *inc * 40 > 300,
+                "time control {label} is rejected by /api/board/seek"
+            );
+        }
+    }
 }

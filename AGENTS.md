@@ -1,15 +1,17 @@
 # RChess TUI — Agent Guide
 
-**Single Rust binary crate** (`ratatui` + `crossterm`), no workspace, no tests. Target zero warnings.
+**Single Rust binary crate** (`ratatui` + `crossterm`), no workspace. Target zero warnings.
 
 ## Build & run
 
 ```
 cargo build --release
+cargo clippy --all-targets   # must stay warning-free
+cargo test --release         # movegen perft, config, lichess parsing
 ./target/release/rchess
 ```
 
-No test, lint, or typecheck commands exist.
+`cargo fmt` is not enforced: the tree is intentionally unformatted.
 
 ## Debug logging
 
@@ -99,6 +101,27 @@ Pre-defined magic arrays `BISHOP_MAGICS_FIXED`/`ROOK_MAGICS_FIXED` replace brute
 - Path: `~/.config/rchess/rchess_tui.conf`
 - Save from Settings with `w`, or programmatically via `cfg.save()`
 - `Config::load()` — reads file, falls back to `Config::default()`
+- `Setting::ALL` in `config.rs` is the single source of truth for the settings
+  screen and the key handler; add a variant there when adding a setting, or the
+  two lists will drift out of sync.
+- The Lichess token can be entered in Settings (row 19, masked). It is written
+  with explicit `(key, value)` pairs — never positional `format!` arguments.
+
+## Online play (Lichess)
+
+- Token needs the `board:play` scope; enter it in Settings (row 19) or the
+  config file. The token is never echoed in full by the UI.
+- A seek is `POST /api/board/seek` and its **response stream must stay open**:
+  closing it cancels the seek. `SeekHandle` in `lichess.rs` owns the live
+  response; dropping it cancels the seek.
+- The server move list is authoritative. `sync_online_state()` diffs it against
+  `online_moves` and replays new moves with `push_server_move()`; our own move
+  is never echoed back to the API.
+- Only standard / from-position games are supported. Other variants are refused
+  in the lobby and aborted if they arrive through the event stream.
+- Draw and takeback endpoints take `yes`/`no`, not `true`/`false`.
+- Leaving the lobby (Esc) drops the event stream so a challenge cannot yank the
+  user into a game from the main menu.
 
 ## Analysis engine
 

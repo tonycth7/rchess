@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture,
-        Event, KeyEventKind, MouseButton, MouseEventKind,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -59,15 +59,28 @@ fn main() -> io::Result<()> {
                 println!("  arrows / hjkl         Move cursor");
                 println!("  Enter / Space         Select piece / confirm");
                 println!("  any letter            Type a move (e2e4, Nf3, O-O)");
-                println!("  E (Shift+E)           Export board as PNG");
+                println!("  u / r                 Undo / redo");
+                println!("  e                     Engine hint arrow");
+                println!("  G                     Save PGN");
                 println!("  F                     Copy FEN to clipboard");
-                println!("  u                     Undo");
-                println!("  d                     Offer draw");
-                println!("  r                     Analyze");
+                println!("  E (Shift+E)           Export board as PNG");
+                println!("  T                     Cycle UI mode");
+                println!("  ?                     Keyboard help overlay");
+                println!("  d                     Offer draw (two players)");
                 println!("  n / s / q             New game / Settings / Menu");
+                println!("  Ctrl+C                Quit");
                 println!("  mouse click           Select and move pieces");
                 println!("  right-click           Undo");
                 println!("  scroll wheel          Scroll in menus/lists");
+                println!();
+                println!("ONLINE (LICHESS) KEYS:");
+                println!("  p                     Seek a random opponent");
+                println!("  c                     Challenge a user");
+                println!("  d / D                 Accept / decline draw offer");
+                println!("  t                     Offer or accept a takeback");
+                println!("  v / x / a             Claim win / resign / abort");
+                println!("  R                     Resync the game");
+                println!("  Esc / q               Back to lobby");
                 println!();
                 println!("FILES:");
                 println!("  Config:  ~/.config/rchess/rchess_tui.conf");
@@ -95,6 +108,13 @@ fn main() -> io::Result<()> {
 
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode()?;
+    // A panic must not leave the user's terminal in raw/alternate-screen mode.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        default_hook(info);
+    }));
     let mut stdout = io::stdout();
     crate::rcengine::init();
     let mut app       = App::new();
@@ -124,6 +144,17 @@ fn main() -> io::Result<()> {
             match event::read()? {
                 // ── Keyboard ──────────────────────────────────────────────────
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
+                    {
+                        app.should_quit = true;
+                    } else if key.code == KeyCode::Char('?') && !app.text_input_active() {
+                        app.help = !app.help;
+                    } else if app.help {
+                        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                            app.help = false;
+                        }
+                    } else {
                     match app.screen {
                         Screen::Menu        => app.handle_menu_key(key.code),
                         Screen::ColorPick   => app.handle_color_key(key.code),
@@ -140,6 +171,7 @@ fn main() -> io::Result<()> {
                         // OnlineJoin removed (challenge via lobby)
                         Screen::OnlineGame  => app.handle_online_game_key(key.code),
                         Screen::LoadGame    => app.handle_load_game_key(key.code),
+                    }
                     }
                 }
                 // ── Mouse ─────────────────────────────────────────────────────

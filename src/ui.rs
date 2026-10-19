@@ -7,8 +7,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph},
 };
-use crate::app::{App, Gs, Mode, Screen, ClockState, GameEnd, ReplaySnap, MoveLabel, VERSION};
-use crate::config::{MoveHints, PieceStyle, Theme, UiMode};
+use crate::app::{App, Gs, Mode, Screen, ClockState, GameEnd, ReplaySnap, MoveLabel, VERSION, ONLINE_TCS};
+use crate::config::{MoveHints, PieceStyle, Setting, Theme, UiMode};
 use crate::engine::{Color as PC, Kind, Piece, Status, king_sq};
 use crate::pieces;
 
@@ -150,6 +150,103 @@ pub fn render(app: &App, f: &mut Frame) {
         Screen::OnlineGame  => draw_online_game(app, f),
         Screen::LoadGame    => draw_load_game(app, f),
     }
+    if app.help { draw_help(app, f); }
+}
+
+// ── HELP OVERLAY ──────────────────────────────────────────────────────────────
+fn draw_help(app: &App, f: &mut Frame) {
+    let th = app.cfg.theme;
+    let (title, rows): (&str, Vec<(&str, &str)>) = match app.screen {
+        Screen::Menu => ("MENU", vec![
+            ("↑↓ / jk", "move selection"),
+            ("Enter / Space", "open the selected item"),
+            ("s", "settings"),
+            ("q / Esc", "quit"),
+        ]),
+        Screen::Settings => ("SETTINGS", vec![
+            ("↑↓ / jk", "move between settings"),
+            ("←→ / hl", "change value"),
+            ("Enter", "edit the Lichess token"),
+            ("w / s", "save config"),
+            ("r", "restore defaults"),
+            ("Esc / q", "back"),
+        ]),
+        Screen::OnlineLobby => ("LICHESS LOBBY", vec![
+            ("↑↓ / jk", "select a challenge"),
+            ("a / d", "accept / decline challenge"),
+            ("Enter", "accept challenge, or resume a game"),
+            ("1 / 2 / 3", "resume an ongoing game"),
+            ("p", "find a random opponent"),
+            ("r / t", "rated toggle / time control"),
+            ("c", "challenge a user"),
+            ("R", "reconnect and refresh"),
+            ("s / q", "settings / main menu"),
+        ]),
+        Screen::OnlineGame => ("ONLINE GAME", vec![
+            ("mouse / arrows", "move pieces (your turn only)"),
+            ("letters + Enter", "type a move (e2e4, Nf3, O-O)"),
+            ("d / D", "offer-or-accept / decline draw"),
+            ("c", "chat"),
+            ("t", "offer-or-accept takeback"),
+            ("v / x / a", "claim win / resign / abort"),
+            ("R", "resync with server"),
+            ("q / Esc", "leave to lobby"),
+        ]),
+        Screen::Game => ("GAME", vec![
+            ("mouse / arrows", "move pieces"),
+            ("letters + Enter", "type a move (e2e4, Nf3, O-O)"),
+            ("u / r", "undo / redo"),
+            ("e", "engine hint arrow"),
+            ("T", "cycle UI mode"),
+            ("G / F / E", "save PGN / copy FEN / export PNG"),
+            ("d", "offer a draw (two players)"),
+            ("n", "new game"),
+        ]),
+        Screen::Analyze => ("ANALYSIS", vec![
+            ("←→ / hl", "step through moves"),
+            ("PgUp / PgDn", "jump 10 moves"),
+            ("[ / ]", "previous / next mistake"),
+            ("Home / 0", "jump to start"),
+            ("End / $", "jump to end"),
+            ("Esc / q", "back to game"),
+        ]),
+        Screen::Puzzle => ("PUZZLE", vec![
+            ("mouse / arrows", "play the solution"),
+            ("Enter / Space", "continue after a correct move"),
+            ("n", "next puzzle"),
+            ("Esc / q", "menu"),
+        ]),
+        _ => ("GENERAL", vec![
+            ("Enter", "confirm"),
+            ("Esc / q", "back"),
+            ("↑↓ / jk", "navigate"),
+        ]),
+    };
+
+    let mut lines = vec![Line::from("")];
+    for (key, desc) in rows {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<18}"), sty(ac(th)).add_modifier(Modifier::BOLD)),
+            Span::styled(desc, sty(cream())),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled("  ? or Esc closes this help", sty(dim(th)))]));
+
+    let w = 58u16.min(f.area().width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(f.area().height.saturating_sub(2));
+    let rect = center(w, h, f.area());
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+                .title(Span::styled(format!(" ⌨  KEYBOARD HELP · {title} "),
+                    sty(ac(th)).add_modifier(Modifier::BOLD)))
+                .padding(Padding::new(1, 1, 0, 0)),
+        ),
+        rect,
+    );
 }
 
 // ── MENU ──────────────────────────────────────────────────────────────────────
@@ -192,7 +289,7 @@ fn draw_menu(app: &App, f: &mut Frame) {
     }
     lines.push(Line::from(vec![Span::styled(format!("  {:─<54}",""), sty(dimmer()))]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled("  ↑↓ navigate    Enter select    q quit", sty(dimmer()))]));
+    lines.push(Line::from(vec![Span::styled("  ↑↓ navigate    Enter select    ? help    q quit", sty(dimmer()))]));
     f.render_widget(Paragraph::new(lines).block(
         Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
             .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
@@ -243,40 +340,20 @@ fn draw_settings(app: &App, f: &mut Frame) {
     let w    = 72u16.min(area.width.saturating_sub(4));
     let rect = center(w, h, area);
 
-    // All settings rows
-    let highlight_str = match app.cfg.highlight_brightness {
-        0 => "0  (dim)", 5 => "5  (default)", 10 => "10 (vivid)",
-        n => Box::leak(format!("{}", n).into_boxed_str()),
-    };
-    let sf_skill_str = Box::leak(format!("{} (0-20)", app.cfg.stockfish_skill).into_boxed_str());
-    let rows: &[(&str, &str)] = &[
-        ("Theme",            app.cfg.theme.name()),
-        ("Piece style",      app.cfg.piece_style.name()),
-        ("AI difficulty",    app.cfg.ai_depth.name()),
-        ("Move hints",       app.cfg.move_hints.name()),
-        ("Time control",     app.cfg.time_control.name()),
-        ("Show coords",      if app.cfg.show_coords {"ON"} else {"OFF"}),
-        ("Show clock",       if app.cfg.show_clock  {"ON"} else {"OFF"}),
-        ("Flip board",       if app.cfg.flip_board  {"ON"} else {"OFF"}),
-        ("Auto-flip PvP",    if app.cfg.auto_flip   {"ON"} else {"OFF"}),
-        ("Confirm move",     if app.cfg.confirm_move{"ON"} else {"OFF"}),
-        ("Auto-promote",     if app.cfg.auto_promote {"ON (queen)"} else {"OFF"}),
-        ("UI mode",          app.cfg.ui_mode.name()),
-        ("Analysis engine",  app.cfg.analysis_engine.name()),
-        ("Analysis depth",   match app.cfg.analysis_depth { 1=>"1  (fast)", 2=>"2  (balanced)", _=>"3  (strong)" }),
-        ("Stockfish skill",  sf_skill_str),
-        ("Auto-save PNG",    if app.cfg.auto_save_png  {"ON"} else {"OFF"}),
-        ("Auto-save game",   if app.cfg.auto_save_game {"ON"} else {"OFF"}),
-        ("Highlight bright", highlight_str),
-        ("TTY mode",         if app.cfg.tty_mode {"ON  (16-col / ASCII)"} else {"OFF (truecolor)"}),
-        ("Lichess token",    if app.cfg.lichess_token.is_empty() {"(not set)"} else {"(configured ✓)"}),
-    ];
+    // All settings rows, generated from the shared catalog so the UI and the
+    // key handler can never drift apart.
+    let rows: Vec<(&str, String)> = Setting::ALL
+        .iter()
+        .map(|s| (s.label(), s.value(&app.cfg)))
+        .collect();
     let n = rows.len();
 
     // Content area: rect minus 2 border rows minus 2 padding rows
     let content_h = rect.height.saturating_sub(4);
-    // Overhead: leading blank + top separator + blank + scroll top + scroll bottom + bottom separator = 6
-    let budget = (content_h as usize).saturating_sub(6);
+    // Overhead: leading blank + top separator + blank + scroll top + scroll bottom
+    // + bottom separator + footer. The token editor needs a second footer line.
+    let footer_lines = if app.token_edit { 2 } else { 1 };
+    let budget = (content_h as usize).saturating_sub(5 + footer_lines);
     let visible = (budget / 2).max(3);
 
     // Scroll to keep selected row visible
@@ -299,7 +376,7 @@ fn draw_settings(app: &App, f: &mut Frame) {
     }
 
     // Visible rows
-    for (i, &(label, value)) in rows
+    for (i, (label, value)) in rows
         .iter()
         .enumerate()
         .take((scroll + visible).min(n))
@@ -333,8 +410,27 @@ fn draw_settings(app: &App, f: &mut Frame) {
     // Footer separator
     lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(dimmer()))]));
 
-    // Save notice or hint
-    if app.saved_notice.is_some() {
+    // Save notice or token editor
+    if app.token_edit {
+        let shown = if app.token_buf.is_empty() {
+            "█".to_string()
+        } else {
+            let n = app.token_buf.chars().count();
+            format!("{}{}", "•".repeat(n), "█")
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Token: ", sty(ac(th)).add_modifier(Modifier::BOLD)),
+            Span::styled(shown, sty(success(th))),
+        ]));
+        lines.push(Line::from(vec![Span::styled(
+            if let Some(err) = &app.token_err {
+                format!("  ✗ {err}")
+            } else {
+                "  Enter save & connect   Esc cancel   (lichess.org/account/oauth/token)".to_string()
+            },
+            sty(if app.token_err.is_some() { danger(th) } else { dim(th) }),
+        )]));
+    } else if app.saved_notice.is_some() {
         let home = std::env::var("HOME").unwrap_or_default();
         let path = format!("{}/.config/rchess/rchess_tui.conf", home);
         lines.push(Line::from(vec![
@@ -343,7 +439,7 @@ fn draw_settings(app: &App, f: &mut Frame) {
         ]));
     } else {
         lines.push(Line::from(vec![Span::styled(
-            "  w/s save  r reset  ←→/hl change  jk navigate  Esc back",
+            "  w/s save  r reset  ←→/hl change  Enter edit token  jk move  Esc back",
             sty(dimmer()),
         )]));
     }
@@ -377,16 +473,31 @@ fn draw_game(app: &App, f: &mut Frame) {
     let is_over = matches!(app.gs.status, Status::Checkmate|Status::Stalemate|Status::Draw)
                || app.gs.clock_state == ClockState::Flagged
                || app.game_end == GameEnd::Draw;
-    if is_over { draw_gameover(app, f); }
+    // Online games draw their own result banner (it also covers resign/timeout).
+    if is_over && app.screen != Screen::OnlineGame { draw_gameover(app, f); }
 }
 
 fn draw_topbar(app: &App, f: &mut Frame, area: Rect) {
     let th = app.cfg.theme;
-    let mode_s = match app.mode {
-        Mode::PvP => "TWO PLAYERS".to_string(),
-        Mode::Cpu  => format!("VS CPU [YOU:{}] [{}]",
-            app.player_color.name(),
-            app.cfg.ai_depth.name().split_whitespace().next().unwrap_or("")),
+    let mode_s = if matches!(app.screen, Screen::OnlineGame) {
+        let opp = app.lichess_opponent.clone().unwrap_or_else(|| "Lichess".into());
+        let rating = app.lichess_opponent_rating.map(|r| format!(" ({r})")).unwrap_or_default();
+        let tc = if app.online_tc_label.is_empty() { String::new() } else { format!(" {}", app.online_tc_label) };
+        let turn = if app.online_result.is_some() {
+            " · FINISHED"
+        } else if app.gs.turn == app.player_color {
+            " · YOUR MOVE"
+        } else {
+            ""
+        };
+        format!("ONLINE{tc} vs {opp}{rating}{turn}")
+    } else {
+        match app.mode {
+            Mode::PvP => "TWO PLAYERS".to_string(),
+            Mode::Cpu  => format!("VS CPU [YOU:{}] [{}]",
+                app.player_color.name(),
+                app.cfg.ai_depth.name().split_whitespace().next().unwrap_or("")),
+        }
     };
     let (st, col) = status_str(app, th);
     let clock     = if app.cfg.show_clock { format!("  Mv {}", app.gs.fullmove) } else { String::new() };
@@ -612,11 +723,16 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect, cell_w: usize, cell_h: usize
         lines.push(Line::from(spans));
     }
 
+    let board_title = if app.screen == Screen::OnlineGame {
+        format!(" BOARD · {} ", trunc(&app.online_status, 42))
+    } else {
+        " BOARD ".to_string()
+    };
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
                 .border_style(sty(ac(th))).style(Style::default().bg(bg0(th)))
-                .title(Span::styled(" BOARD ", sty(ac(th)).add_modifier(Modifier::BOLD)))
+                .title(Span::styled(board_title, sty(ac(th)).add_modifier(Modifier::BOLD)))
         ),
         area,
     );
@@ -663,9 +779,15 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
     } else if !app.input_buf.is_empty() {
         (" Enter=exec  Esc=cancel  Del=pop".to_string(), dimmer())
     } else if is_online {
-        (" arrows  a=abort  c=chat  d=draw  t=takeback  v=claim  x=resign".to_string(), dimmer())
+        let keys = if app.online_result.is_some() {
+            " q=lobby  r=analyze  E=PNG  c=chat".to_string()
+        } else {
+            format!(" d=draw  D=decline  c=chat  t=takeback  v=claim  x=resign  q=lobby  ({})",
+                if app.gs.turn == app.player_color { "your move" } else { "opponent" })
+        };
+        (keys, dimmer())
     } else {
-        (" arrows  E=PNG  F=FEN  d=draw  e=hints  u=undo  r=redo  q=menu".to_string(), dimmer())
+        (" arrows  e=hints  u=undo  r=redo  G=PGN  F=FEN  ?=help  q=menu".to_string(), dimmer())
     };
 
     let border_col = if !app.input_buf.is_empty(){ac(th)} else if app.input_err.is_some(){danger(th)} else {dim(th)};
@@ -2056,88 +2178,152 @@ fn draw_load_game(app: &App, f: &mut Frame) {
 
 fn draw_online_lobby(app: &App, f: &mut Frame) {
     let th = app.cfg.theme;
-    let has_token = !app.cfg.lichess_token.is_empty();
-    let connected = app.lichess.is_some();
-    let mut lines = vec![
-        Line::from(vec![Span::styled("  ONLINE PLAY", sty(ac(th)).add_modifier(Modifier::BOLD))]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Account: ", sty(ac(th))),
-            Span::styled(if connected { &app.player_name } else { "—" }, sty(if connected { success(th) } else { dim(th) })),
-        ]),
-        Line::from(vec![Span::styled(format!("  Status: {}", app.online_status), sty(if connected { success(th) } else { dim(th) }))]),
-        Line::from(""),
-    ];
-    if !has_token {
-        lines.push(Line::from(vec![Span::styled("  Set lichess_token in Settings", sty(danger(th)))]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled("  s  Settings", sty(dim(th)))]));
-    } else if connected {
-        let tcs = ["10+0", "5+5", "15+10", "30+0"];
-        let tc_label = tcs[app.online_tc_idx.min(tcs.len() - 1)];
-        let rated_label = if app.online_rated { "Rated" } else { "Casual" };
+    let has_token = app.cfg.has_lichess_token();
+    let connected = app.lichess_connected;
+    let mut lines: Vec<Line> = vec![Line::from("")];
 
-        // Match settings
-        lines.push(Line::from(vec![Span::styled("  MATCH SETTINGS:", sty(ac(th)).add_modifier(Modifier::BOLD))]));
-        lines.push(Line::from(vec![
-            Span::styled(format!("   {}  {}", rated_label, tc_label), sty(cream())),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("   r  toggle rated    t  cycle time", sty(dim(th))),
-        ]));
-        lines.push(Line::from(""));
-
-        // Play random
-        if app.online_seeking {
-            lines.push(Line::from(vec![Span::styled("  Seeking opponent... (Esc to cancel)", sty(warning(th)))]));
+    // ── Account ──
+    if has_token {
+        let name = if connected && !app.player_name.is_empty() {
+            app.player_name.as_str()
         } else {
-            lines.push(Line::from(vec![Span::styled("  p  Play random", sty(success(th)).add_modifier(Modifier::BOLD))]));
+            "not signed in"
+        };
+        let rating = if connected {
+            app.lichess.as_ref()
+                .and_then(|c| c.account.as_ref())
+                .and_then(|a| a.rating)
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let state = if connected {
+            "● connected"
+        } else if app.lichess.is_some() {
+            "○ connecting…"
+        } else {
+            "○ offline"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {name}{rating}"), sty(cream()).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("   {state}"), sty(if connected { success(th) } else { warning(th) })),
+        ]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            "  No Lichess token configured", sty(danger(th)).add_modifier(Modifier::BOLD))]));
+    }
+    lines.push(Line::from(vec![Span::styled(format!("  {}", trunc(&app.online_status, 62)), sty(dim(th)))]));
+    lines.push(Line::from(""));
+
+    if !has_token {
+        // Onboarding
+        lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(dimmer()))]));
+        lines.push(Line::from(vec![Span::styled("  TO PLAY ONLINE", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+        lines.push(Line::from(vec![Span::styled("   1. Open lichess.org/account/oauth/token", sty(cream()))]));
+        lines.push(Line::from(vec![Span::styled("   2. Create a token with the board:play scope", sty(cream()))]));
+        lines.push(Line::from(vec![Span::styled("   3. Press s, select Lichess token, Enter to paste", sty(cream()))]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  s ", sty(success(th)).add_modifier(Modifier::BOLD)),
+            Span::styled("Settings   ", sty(dim(th))),
+            Span::styled("q ", sty(dim(th))),
+            Span::styled("main menu", sty(dim(th))),
+        ]));
+    } else {
+        // ── Match settings ──
+        lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(dimmer()))]));
+        let (tc_label, _) = ONLINE_TCS[app.online_tc_idx.min(ONLINE_TCS.len() - 1)];
+        lines.push(Line::from(vec![
+            Span::styled("  MATCH ", sty(ac(th)).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{} · {tc_label}", if app.online_rated { "Rated" } else { "Casual" }), sty(cream())),
+            Span::styled("      r rated   t time", sty(dim(th))),
+        ]));
+        if app.online_seeking {
+            lines.push(Line::from(vec![Span::styled(
+                "  ● Searching for an opponent…  Esc to cancel", sty(warning(th)))]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  p ", sty(success(th)).add_modifier(Modifier::BOLD)),
+                Span::styled("Find a random opponent", sty(cream())),
+            ]));
         }
         lines.push(Line::from(""));
 
-        // Show available challenges
+        // ── Ongoing games ──
+        if !app.online_games.is_empty() {
+            lines.push(Line::from(vec![Span::styled("  ONGOING GAMES", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+            for (i, g) in app.online_games.iter().take(3).enumerate() {
+                let rating = g.opponent_rating.map(|r| format!(" ({r})")).unwrap_or_default();
+                let turn = if g.is_my_turn { "your turn" } else { "waiting" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("   {} vs {}{rating}", i + 1, g.opponent), sty(cream())),
+                    Span::styled(format!("  {} · {} · {turn}", if g.rated { "rated" } else { "casual" }, g.speed), sty(dim(th))),
+                ]));
+            }
+            lines.push(Line::from(vec![Span::styled("   1/2/3 resume · Enter first game", sty(dim(th)))]));
+            lines.push(Line::from(""));
+        }
+
+        // ── Challenges ──
+        lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(dimmer()))]));
         if app.lichess_challenges.is_empty() {
             lines.push(Line::from(vec![Span::styled("  No incoming challenges", sty(dim(th)))]));
         } else {
-            lines.push(Line::from(vec![Span::styled("  CHALLENGES:", sty(ac(th)).add_modifier(Modifier::BOLD))]));
-            for ch in &app.lichess_challenges {
+            lines.push(Line::from(vec![Span::styled("  CHALLENGES", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+            for (i, ch) in app.lichess_challenges.iter().take(3).enumerate() {
+                let selected = i == app.challenge_cur.min(app.lichess_challenges.len() - 1);
                 let rating = ch.challenger_rating.map(|r| r.to_string()).unwrap_or_else(|| "?".into());
-                let tc = &ch.time_control;
+                let line = format!("{} ({rating}) · {} · {}", ch.challenger_name, ch.time_control, ch.variant);
                 lines.push(Line::from(vec![
-                    Span::styled(format!("   {} ({}", ch.challenger_name, rating), sty(ac(th))),
-                    Span::styled(format!(", {tc}, {})", ch.variant), sty(dim(th))),
+                    Span::styled(if selected { "  ▸ " } else { "    " }, sty(ac(th))),
+                    Span::styled(
+                        trunc(&line, 58),
+                        if selected { sty(cream()).add_modifier(Modifier::BOLD) } else { sty(dim(th)) },
+                    ),
                 ]));
             }
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled("  a  accept    d  decline", sty(dim(th)))]));
+            lines.push(Line::from(vec![Span::styled(
+                "   j/k select   a accept   d decline", sty(dim(th)))]));
         }
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled("  c  Challenge user", sty(ac(th)))]));
+
+        // ── Challenge composer ──
         if app.challenge_mode {
             let blink = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() / 500).is_multiple_of(2);
-            let cursor = if blink { "\u{2588}" } else { " " };
-            let display = if app.challenge_buf.is_empty() { format!("{cursor}_") } else { format!("{}{}", app.challenge_buf, cursor) };
-            lines.push(Line::from(vec![Span::styled(format!("     Enter username: [{display}]"), sty(ac(th)))]));
-            lines.push(Line::from(vec![Span::styled("     Enter to send    Esc to cancel", sty(dim(th)))]));
+            let cursor = if blink { "█" } else { " " };
+            lines.push(Line::from(vec![
+                Span::styled("  Challenge: ", sty(ac(th))),
+                Span::styled(format!("{}{cursor}", app.challenge_buf), sty(cream())),
+            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "  Enter send   Esc cancel", sty(dim(th)))]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  c ", sty(ac(th)).add_modifier(Modifier::BOLD)),
+                Span::styled("Challenge a user   ", sty(cream())),
+                Span::styled("R ", sty(ac(th))),
+                Span::styled("reconnect   ", sty(cream())),
+                Span::styled("s ", sty(ac(th))),
+                Span::styled("settings", sty(cream())),
+            ]));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled("  q  Main menu    s  Settings", sty(dim(th)))]));
-    } else {
-        lines.push(Line::from(vec![Span::styled("  Connecting...", sty(dim(th)))]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled("  q  Main menu", sty(dim(th)))]));
+        lines.push(Line::from(vec![
+            Span::styled("  q ", sty(dim(th))),
+            Span::styled("main menu", sty(dim(th))),
+        ]));
     }
 
-    let h = lines.len() as u16 + 4;
-    let rect = center(56, h.min(28), f.area());
+    let h = (lines.len() as u16 + 4).min(f.area().height.saturating_sub(2));
+    let rect = center(70, h, f.area());
     f.render_widget(Paragraph::new(lines).block(
         Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
             .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(" LOBBY ", sty(ac(th))))
-            .padding(Padding::new(2, 2, 1, 1)),
+            .title(Span::styled(" ♞ LICHESS ONLINE ", sty(ac(th)).add_modifier(Modifier::BOLD)))
+            .padding(Padding::new(1, 1, 0, 0)),
     ), rect);
 }
 
@@ -2145,24 +2331,15 @@ fn draw_online_game(app: &App, f: &mut Frame) {
     draw_game(app, f);
     let th = app.cfg.theme;
     let rect = f.area();
-    if let Some(ref opp) = app.lichess_opponent {
-        let rating = app.lichess_opponent_rating.map(|r| format!(" ({r})")).unwrap_or_default();
-        let top = Rect::new(rect.x + 2, rect.y + 1, rect.width.saturating_sub(4), 1);
-        f.render_widget(Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(" \u{2654} ", sty(ac(th))),
-                Span::styled(format!("{opp}{rating}"), sty(ac(th))),
-            ])
-        ]).block(Block::default().style(Style::default().bg(bg0(th)))), top);
-    }
-    // Chat panel (bottom-right, above status bar)
+
+    // Chat panel (bottom-right, above the input line)
     if !app.chat_messages.is_empty() || app.online_chat_mode || !app.chat_buf.is_empty() {
-        let panel_w = 36u16.min(rect.width.saturating_sub(4));
+        let panel_w = 38u16.min(rect.width.saturating_sub(6));
         let max_vis = 6usize;
         let chat_h = (app.chat_messages.len().min(max_vis) + if app.online_chat_mode { 2 } else { 1 }) as u16;
         let chat_rect = Rect::new(
             rect.x + rect.width.saturating_sub(panel_w + 2),
-            rect.y + rect.height.saturating_sub(chat_h + 6),
+            rect.y + rect.height.saturating_sub(chat_h + 7),
             panel_w, chat_h + 2,
         );
         let mut chat_lines: Vec<Line> = app.chat_messages.iter()
@@ -2182,11 +2359,30 @@ fn draw_online_game(app: &App, f: &mut Frame) {
                 .padding(Padding::new(1, 1, 0, 0)),
         ), chat_rect);
     }
-    // Status bar
-    let status_rect = Rect::new(rect.x + 2, rect.y + rect.height.saturating_sub(4), rect.width.saturating_sub(4), 3);
-    let mut lines = vec![
-        Line::from(vec![Span::styled(format!(" {}", app.online_status), sty(dim(th)))]),
-        Line::from(vec![Span::styled(" Esc/q back to lobby  a=abort  x=resign  t=takeback  v=claim  c=chat  s=settings", sty(dim(th)))]),
-    ];
-    f.render_widget(Paragraph::new(lines).style(sty(dim(th))), status_rect);
+
+    if let Some(result) = &app.online_result {
+        let w = 52u16.min(rect.width.saturating_sub(4));
+        let box_rect = center(w, 9, rect);
+        f.render_widget(Clear, box_rect);
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                trunc(result, (w - 4) as usize),
+                sty(cream()).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::styled(
+                format!(" {}", app.online_tc_label), sty(dim(th)))]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" Esc ", sty(ac(th))), Span::styled("lobby   ", sty(dim(th))),
+                Span::styled(" r ", sty(ac(th))),   Span::styled("analyze   ", sty(dim(th))),
+                Span::styled(" E ", sty(ac(th))),   Span::styled("PNG", sty(dim(th))),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(lines).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(sty(success(th))).style(Style::default().bg(bg1(th)))
+                .title(Span::styled(" GAME OVER ", sty(success(th)).add_modifier(Modifier::BOLD)))
+                .padding(Padding::new(1, 1, 0, 0)),
+        ), box_rect);
+    }
 }
