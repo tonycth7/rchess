@@ -5,41 +5,129 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph},
 };
 use crate::app::{App, Gs, Mode, Screen, ClockState, GameEnd, ReplaySnap, MoveLabel, VERSION};
 use crate::config::{MoveHints, PieceStyle, Theme, UiMode};
-use crate::engine::{Color as PC, Kind, Status, king_sq};
+use crate::engine::{Color as PC, Kind, Piece, Status, king_sq};
 use crate::pieces;
 
+/// One move-list row: half-move index, white and black SAN, the two
+/// selection/highlight flags, and optional annotations for each side.
+type MovePair = (usize, String, String, bool, bool, Option<MoveLabel>, Option<MoveLabel>);
+
+// ── TTY colour fallback ───────────────────────────────────────────────────────
+use std::sync::atomic::{AtomicBool, Ordering};
+pub static TTY_MODE: AtomicBool = AtomicBool::new(false);
+
+fn tty_rgb(c: (u8,u8,u8), th: Theme) -> Color {
+    if !TTY_MODE.load(Ordering::Relaxed) { return Color::Rgb(c.0,c.1,c.2); }
+    if !matches!(th, Theme::MatteBlack | Theme::Mocha) {
+        return Color::Rgb(c.0,c.1,c.2);
+    }
+    let (r, g, b) = c;
+    let r16 = r as u16; let g16 = g as u16; let b16 = b as u16;
+    let max = r16.max(g16).max(b16);
+    let min = r16.min(g16).min(b16);
+    let luma  = (r16 as f32 * 0.2126 + g16 as f32 * 0.7152 + b16 as f32 * 0.0722) as u16;
+    let chroma = (max - min) as i32;
+    // Map colored elements (chroma ≥ 50) to nearest ANSI hue
+    let hue = if chroma < 50 {
+        255 // neutral marker
+    } else if b16 > r16 + 30 && b16 > g16 + 30 {
+        12  // clearly blue-dominant → BrightBlue
+    } else if b16 > r16 && b16 > g16 {
+        14  // slightly blue-dominant → BrightCyan
+    } else if r16 > b16 + 80 && g16 > b16 + 40 {
+        11  // both r and g high vs b → BrightYellow
+    } else if r16 > g16 + 30 && r16 > b16 + 30 {
+        9   // r strongly dominant → BrightRed
+    } else if g16 > r16 + 30 && g16 > b16 + 30 {
+        10  // g strongly dominant → BrightGreen
+    } else if g16 > b16 + 60 {
+        14  // g significantly > b → BrightCyan
+    } else {
+        13  // default → BrightMagenta
+    };
+    let idx = if matches!(th, Theme::MatteBlack) {
+        if      luma < 20  { 0 }        // bg0,bg1
+        else if luma < 40  { 8 }        // dark sq
+        else if luma < 60  { 7 }        // light sq
+        else if chroma < 50 { 15 }      // neutral high-luma (pieces, dim)
+        else               { hue }      // colored accent/select/cursor
+    } else { // Mocha
+        if      luma < 30  { 0 }        // bg1
+        else if luma < 55  { 8 }        // bg0, dark sq
+        else if luma < 90  { 7 }        // light sq
+        else if chroma < 50 {           // neutral
+            if luma < 160 { 0 } else { 15 } // piece_black=0, dim=0, piece_white=15
+        } else               { hue }    // colored accent/select/cursor/last_move
+    };
+    Color::Indexed(idx)
+}
+
 // ── Palette helpers ───────────────────────────────────────────────────────────
-fn rgb(c: (u8,u8,u8)) -> Color { Color::Rgb(c.0,c.1,c.2) }
-fn bg0(th: Theme) -> Color { rgb(th.bg_colors().0) }
-fn bg1(th: Theme) -> Color { rgb(th.bg_colors().1) }
-fn ac(th: Theme)  -> Color { rgb(th.accent()) }
-fn sq_l(th: Theme)-> Color { rgb(th.squares().0) }
-fn sq_d(th: Theme)-> Color { rgb(th.squares().1) }
-fn pw(th: Theme)  -> Color { rgb(th.piece_colors().0) }
-fn pb_c(th: Theme)-> Color { rgb(th.piece_colors().1) }
+fn rgb(c: (u8,u8,u8), th: Theme) -> Color { tty_rgb(c, th) }
+fn bg0(th: Theme) -> Color { rgb(th.bg_colors().0, th) }
+fn bg1(th: Theme) -> Color { rgb(th.bg_colors().1, th) }
+fn ac(th: Theme)  -> Color { rgb(th.accent(), th) }
+fn sq_l(th: Theme)-> Color { rgb(th.squares().0, th) }
+fn sq_d(th: Theme)-> Color { rgb(th.squares().1, th) }
+fn pw(th: Theme)  -> Color { rgb(th.piece_colors().0, th) }
+fn pb_c(th: Theme)-> Color { rgb(th.piece_colors().1, th) }
+fn danger(th: Theme)  -> Color { rgb(th.danger(), th) }
+fn warning(th: Theme) -> Color { rgb(th.warning(), th) }
+fn success(th: Theme) -> Color { rgb(th.success(), th) }
+fn info(th: Theme)    -> Color { rgb(th.info(), th) }
+fn dim(th: Theme)     -> Color { rgb(th.text_dim(), th) }
 fn sty(c: Color)  -> Style { Style::default().fg(c) }
 
-const CREAM:  Color = Color::Rgb(220,210,185);
-const DIM:    Color = Color::Rgb(110,130,110);
-const DIMMER: Color = Color::Rgb(55, 70, 55);
-const RED:    Color = Color::Rgb(200, 70, 70);
-const TEAL:   Color = Color::Rgb(80, 180,140);
-const AMBER:  Color = Color::Rgb(220,160, 40);
-const GREEN:  Color = Color::Rgb(120,220,160);
+fn tty_boost(c: (u8,u8,u8)) -> Color {
+    if !TTY_MODE.load(Ordering::Relaxed) { return Color::Rgb(c.0,c.1,c.2); }
+    let (r,g,b) = c;
+    let max_ch = r.max(g).max(b) as u16;
+    if max_ch < 80 {
+        let add = 80 - max_ch;
+        Color::Rgb(
+            (r as u16 + add).min(255) as u8,
+            (g as u16 + add).min(255) as u8,
+            (b as u16 + add).min(255) as u8,
+        )
+    } else { Color::Rgb(r,g,b) }
+}
+fn cream()  -> Color { tty_boost((220,210,185)) }
+fn dimmer() -> Color { tty_boost((55,70,55)) }
 
 // Board cell dimensions are auto-computed from terminal size each frame.
 
-// Safely truncate to max visible chars
+// Safely truncate to at most `max` characters (Unicode-aware).
 fn trunc(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max { return s.to_string(); }
-    let mut out: String = chars[..max.saturating_sub(2)].iter().collect();
+    if s.chars().count() <= max { return s.to_string(); }
+    let mut out: String = s.chars().take(max.saturating_sub(2)).collect();
     out.push_str("..");
     out
+}
+
+/// Format a centipawn evaluation for display.
+/// Handles mate scores: ±99999 cp (rcengine) → "M1", Stockfish ±30000 → "M1".
+fn fmt_eval(cp: i32) -> String {
+    if cp > 90_000 {
+        let d = (99_999 - cp).max(1);
+        format!("M{}", d)
+    } else if cp < -90_000 {
+        let d = (99_999 + cp).max(1);
+        format!("-M{}", d)
+    } else if cp.abs() == 30_000 {
+        format!("{}M1", if cp > 0 { "" } else { "-" })
+    } else {
+        let v = cp as f32 / 100.0;
+        if v > 0.0 { format!("+{:.2}", v) } else { format!("{:.2}", v) }
+    }
+}
+
+/// Same as fmt_eval but takes an f32 (already divided by 100).
+fn fmt_eval_f32(v: f32) -> String {
+    fmt_eval((v * 100.0).round() as i32)
 }
 
 // ── Entry ─────────────────────────────────────────────────────────────────────
@@ -53,43 +141,44 @@ pub fn render(app: &App, f: &mut Frame) {
         Screen::Game        => draw_game(app, f),
         Screen::Promo       => { draw_game(app, f); draw_promo(app, f); }
         Screen::DrawOffer   => { draw_game(app, f); draw_draw_offer(app, f); }
-        Screen::Replay      => draw_replay(app, f),
+        Screen::Analyze      => draw_analyze(app, f),
         Screen::PngPreview  => { draw_game(app, f); draw_png_preview(app, f); }
         Screen::PgnSaved    => { draw_game(app, f); draw_pgn_saved(app, f); }
-        Screen::FenInput    => draw_fen_input(app, f),
-        Screen::PgnImport   => draw_pgn_import(app, f),
+        Screen::Import      => draw_import(app, f),
         Screen::Puzzle      => draw_puzzle(app, f),
+        Screen::OnlineLobby => draw_online_lobby(app, f),
+        Screen::OnlineGame  => draw_online_game(app, f),
+        Screen::LoadGame    => draw_load_game(app, f),
     }
 }
 
 // ── MENU ──────────────────────────────────────────────────────────────────────
 fn draw_menu(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
-    let rect = center(58, 28, f.area());
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
-    let opts  = [
+    let rect = center(62, 32, f.area());
+    let opts: &[&str] = &[
+        "  ↻  RESUME GAME",
         "  ♟  TWO PLAYERS",
-        "  ◈  VS COMPUTER   [AI + Opening Book]",
+        "  ♟  VS COMPUTER   [AI + Opening Book]",
+        "  ♟  ONLINE PLAY   [Lichess]",
         "  ⚙  SETTINGS",
-        "  ≡  START FROM FEN",
-        "  ↥  LOAD PGN FILE",
+        "  ♟  IMPORT GAME   [FEN / PGN / file]",
+        "  ♟  LOAD SAVED GAME",
         "  ★  DAILY PUZZLE  [Lichess]",
     ];
+    let logo_st = sty(ac(th)).add_modifier(Modifier::BOLD);
     let mut lines = vec![
         Line::from(""),
-        Line::from(vec![Span::raw("  "), Span::styled("♔ ♕ ♗ ♘ ♖ ♙", sty(pw(th)).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![Span::raw("  "), Span::styled("♟ ♜ ♞ ♝ ♛ ♚", sty(DIM).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled("  ██████╗  ██████╗██╗  ██╗███████╗███████╗███████╗", logo_st)]),
+        Line::from(vec![Span::styled("  ██╔══██╗██╔════╝██║  ██║██╔════╝██╔════╝██╔════╝", logo_st)]),
+        Line::from(vec![Span::styled("  ██████╔╝██║     ███████║█████╗  ███████╗███████╗", logo_st)]),
+        Line::from(vec![Span::styled("  ██╔══██╗██║     ██╔══██║██╔══╝  ╚════██║╚════██║", logo_st)]),
+        Line::from(vec![Span::styled("  ██║  ██║╚██████╗██║  ██║███████╗███████║███████║", logo_st)]),
+        Line::from(vec![Span::styled("  ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝", logo_st)]),
         Line::from(""),
-        Line::from(vec![Span::styled("         R  C H E S S", sty(ac(th)).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![Span::styled(format!("      TERMINAL EDITION  v{}", VERSION), sty(DIM))]),
-        Line::from(vec![Span::styled("      PNG export · PGN · Replay · Mouse", sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("      TERMINAL EDITION  v{}   PNG · PGN · Analyze · Mouse", VERSION), sty(dim(th)))]),
         Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<50}",""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("  {:─<54}",""), sty(dimmer()))]),
         Line::from(""),
     ];
     for (i, &opt) in opts.iter().enumerate() {
@@ -97,34 +186,32 @@ fn draw_menu(app: &App, f: &mut Frame) {
         lines.push(Line::from(vec![
             Span::styled(if s{" ▶ "}else{"   "}, sty(ac(th))),
             Span::styled(format!("{:<48}", opt),
-                if s { Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD) } else { sty(CREAM) }),
+                if s { Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD) } else { sty(cream()) }),
         ]));
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(vec![Span::styled(format!("  {:─<50}",""), sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<54}",""), sty(dimmer()))]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled("  ↑↓ navigate    Enter select    q quit", sty(DIMMER))]));
-    f.render_widget(Paragraph::new(lines), inner);
+    lines.push(Line::from(vec![Span::styled("  ↑↓ navigate    Enter select    q quit", sty(dimmer()))]));
+    f.render_widget(Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .padding(Padding::new(2, 2, 1, 1)),
+    ), rect);
 }
 
 // ── COLOR PICK ────────────────────────────────────────────────────────────────
 fn draw_color_pick(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
     let rect = center(52, 18, f.area());
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
     let mut lines = vec![
         Line::from(""),
-        Line::from(vec![Span::styled("     CHOOSE YOUR SIDE", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled("  CHOOSE YOUR SIDE", sty(ac(th)))]),
         Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<46}",""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("  {:─<46}",""), sty(dimmer()))]),
         Line::from(""),
     ];
-    for (i,(sym,label,fg)) in [("♔","WHITE  — moves first",pw(th)),("♚","BLACK  — moves second",DIM)].iter().enumerate() {
+    for (i,(sym,label,fg)) in [("♔","WHITE  — moves first",pw(th)),("♚","BLACK  — moves second",dim(th))].iter().enumerate() {
         let s = app.color_cur == i;
         lines.push(Line::from(vec![
             Span::styled(if s{" ▶ "}else{"   "}, sty(ac(th))),
@@ -134,10 +221,16 @@ fn draw_color_pick(app: &App, f: &mut Frame) {
         ]));
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(vec![Span::styled(format!("  {:─<46}",""), sty(DIMMER))]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled("  ↑↓ navigate   Enter confirm   Esc back", sty(DIMMER))]));
-    f.render_widget(Paragraph::new(lines), inner);
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<46}",""), sty(dimmer()))]));
+    lines.push(Line::from(vec![Span::styled("  ↑↓/w,b navigate   Enter confirm   Esc back", sty(dimmer()))]));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+                .padding(Padding::new(2, 2, 1, 1)),
+        ),
+        rect,
+    );
 }
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
@@ -150,19 +243,12 @@ fn draw_settings(app: &App, f: &mut Frame) {
     let w    = 72u16.min(area.width.saturating_sub(4));
     let rect = center(w, h, area);
 
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(" ⚙  SETTINGS ", sty(ac(th)).add_modifier(Modifier::BOLD))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
-
     // All settings rows
     let highlight_str = match app.cfg.highlight_brightness {
         0 => "0  (dim)", 5 => "5  (default)", 10 => "10 (vivid)",
         n => Box::leak(format!("{}", n).into_boxed_str()),
     };
+    let sf_skill_str = Box::leak(format!("{} (0-20)", app.cfg.stockfish_skill).into_boxed_str());
     let rows: &[(&str, &str)] = &[
         ("Theme",            app.cfg.theme.name()),
         ("Piece style",      app.cfg.piece_style.name()),
@@ -174,54 +260,62 @@ fn draw_settings(app: &App, f: &mut Frame) {
         ("Flip board",       if app.cfg.flip_board  {"ON"} else {"OFF"}),
         ("Auto-flip PvP",    if app.cfg.auto_flip   {"ON"} else {"OFF"}),
         ("Confirm move",     if app.cfg.confirm_move{"ON"} else {"OFF"}),
+        ("Auto-promote",     if app.cfg.auto_promote {"ON (queen)"} else {"OFF"}),
         ("UI mode",          app.cfg.ui_mode.name()),
         ("Analysis engine",  app.cfg.analysis_engine.name()),
         ("Analysis depth",   match app.cfg.analysis_depth { 1=>"1  (fast)", 2=>"2  (balanced)", _=>"3  (strong)" }),
+        ("Stockfish skill",  sf_skill_str),
         ("Auto-save PNG",    if app.cfg.auto_save_png  {"ON"} else {"OFF"}),
+        ("Auto-save game",   if app.cfg.auto_save_game {"ON"} else {"OFF"}),
         ("Highlight bright", highlight_str),
+        ("TTY mode",         if app.cfg.tty_mode {"ON  (16-col / ASCII)"} else {"OFF (truecolor)"}),
         ("Lichess token",    if app.cfg.lichess_token.is_empty() {"(not set)"} else {"(configured ✓)"}),
     ];
     let n = rows.len();
 
-    // How many rows fit in the visible area (each row = 2 lines: label + blank)
-    // inner height - 4 (header sep + footer sep + 2 lines footer) = visible budget
-    let budget = inner.height.saturating_sub(5) as usize;
-    let visible = (budget / 2).max(1);
+    // Content area: rect minus 2 border rows minus 2 padding rows
+    let content_h = rect.height.saturating_sub(4);
+    // Overhead: leading blank + top separator + blank + scroll top + scroll bottom + bottom separator = 6
+    let budget = (content_h as usize).saturating_sub(6);
+    let visible = (budget / 2).max(3);
 
     // Scroll to keep selected row visible
     let cur = app.settings_cur;
-    // scroll_off: first row index to show
     let scroll = if cur < visible { 0 }
                  else { cur + 1 - visible };
     let scroll = scroll.min(n.saturating_sub(visible));
 
     let mut lines: Vec<Line> = vec![
-        Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(dimmer()))]),
         Line::from(""),
     ];
 
     // Scroll indicator top
     if scroll > 0 {
         lines.push(Line::from(vec![Span::styled(
-            format!("  ▲ {} more above", scroll), sty(DIMMER))]));
+            format!("  ▲ {} more above", scroll), sty(dimmer()))]));
     } else {
         lines.push(Line::from(""));
     }
 
     // Visible rows
-    for i in scroll..(scroll + visible).min(n) {
-        let (label, value) = rows[i];
+    for (i, &(label, value)) in rows
+        .iter()
+        .enumerate()
+        .take((scroll + visible).min(n))
+        .skip(scroll)
+    {
         let s = cur == i;
         lines.push(Line::from(vec![
             Span::styled(if s { " ▶ " } else { "   " }, sty(ac(th))),
             Span::styled(
                 format!("{:<18}", label),
-                if s { sty(ac(th)).add_modifier(Modifier::BOLD) } else { sty(CREAM) },
+                if s { sty(ac(th)).add_modifier(Modifier::BOLD) } else { sty(cream()) },
             ),
             Span::raw("  "),
             Span::styled(
                 if s { format!("◀  {}  ▶", value) } else { format!("   {}   ", value) },
-                if s { Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD) } else { sty(DIM) },
+                if s { Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD) } else { sty(dim(th)) },
             ),
         ]));
         lines.push(Line::from(""));
@@ -231,35 +325,40 @@ fn draw_settings(app: &App, f: &mut Frame) {
     let below = n.saturating_sub(scroll + visible);
     if below > 0 {
         lines.push(Line::from(vec![Span::styled(
-            format!("  ▼ {} more below  (↓ to scroll)", below), sty(DIMMER))]));
+            format!("  ▼ {} more below  (↓ to scroll)", below), sty(dimmer()))]));
     } else {
         lines.push(Line::from(""));
     }
 
     // Footer separator
-    lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(dimmer()))]));
 
     // Save notice or hint
     if app.saved_notice.is_some() {
         let home = std::env::var("HOME").unwrap_or_default();
         let path = format!("{}/.config/rchess/rchess_tui.conf", home);
         lines.push(Line::from(vec![
-            Span::styled("  ✓ Saved  ", sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(path, sty(GREEN)),
+            Span::styled("  ✓ Saved  ", sty(success(th))),
+            Span::styled(path, sty(success(th))),
         ]));
     } else {
         lines.push(Line::from(vec![Span::styled(
             "  w/s save  r reset  ←→/hl change  jk navigate  Esc back",
-            sty(DIMMER),
+            sty(dimmer()),
         )]));
     }
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" ⚙  SETTINGS ", sty(ac(th)).add_modifier(Modifier::BOLD)))
+            .padding(Padding::new(2, 2, 1, 1)),
+    ), rect);
 }
 
 
-// ── BLOCK ART PIECES ──────────────────────────────────────────────────────────
-// Delegates to pieces::render_block_lines for dynamic scaling.
+// ── BLOCK/PIECE ART ─────────────────────────────────────────────────────
+// Delegates to pieces::render_star_lines or render_hash_lines.
 
 // ── GAME ──────────────────────────────────────────────────────────────────────
 fn draw_game(app: &App, f: &mut Frame) {
@@ -275,7 +374,7 @@ fn draw_game(app: &App, f: &mut Frame) {
     draw_input(app, f, input_area);
     draw_sidebar(app, f, side_col);
 
-    let is_over = matches!(app.gs.status, Status::Checkmate|Status::Stalemate)
+    let is_over = matches!(app.gs.status, Status::Checkmate|Status::Stalemate|Status::Draw)
                || app.gs.clock_state == ClockState::Flagged
                || app.game_end == GameEnd::Draw;
     if is_over { draw_gameover(app, f); }
@@ -285,12 +384,12 @@ fn draw_topbar(app: &App, f: &mut Frame, area: Rect) {
     let th = app.cfg.theme;
     let mode_s = match app.mode {
         Mode::PvP => "TWO PLAYERS".to_string(),
-        Mode::CPU  => format!("VS CPU [YOU:{}] [{}]",
+        Mode::Cpu  => format!("VS CPU [YOU:{}] [{}]",
             app.player_color.name(),
             app.cfg.ai_depth.name().split_whitespace().next().unwrap_or("")),
     };
-    let (st, col) = status_str(app);
-    let clock     = if app.cfg.show_clock { format!("  Mv {}  ", app.gs.fullmove) } else { String::new() };
+    let (st, col) = status_str(app, th);
+    let clock     = if app.cfg.show_clock { format!("  Mv {}", app.gs.fullmove) } else { String::new() };
     let opening_str: String = if !app.gs.history.is_empty() && app.gs.history.len() <= 30 {
         crate::book::opening_name(&app.gs.history)
             .map(|n| format!(" [{}]", n))
@@ -310,7 +409,7 @@ fn draw_topbar(app: &App, f: &mut Frame, area: Rect) {
         }
     } else { String::new() };
     f.render_widget(
-        Paragraph::new(format!(" ♟ RChess v{}{}{}{}│  {}  │  {}",
+        Paragraph::new(format!(" ♟ RChess v{}{}{}{}│ {} {}",
             VERSION, clock, book_ind, eval_str, mode_s, st))
             .style(Style::default().fg(col).bg(bg1(th))),
         area,
@@ -325,25 +424,48 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect, cell_w: usize, cell_h: usize
     let CELL_H = cell_h;
     let th      = app.cfg.theme;
     let flipped = app.flipped();
-    let row_ord: Vec<usize> = if flipped { (0..8).rev().collect() } else { (0..8).collect() };
-    let col_ord: Vec<usize> = if flipped { (0..8).rev().collect() } else { (0..8).collect() };
+    let row_ord: [usize; 8] = if flipped { [7,6,5,4,3,2,1,0] } else { [0,1,2,3,4,5,6,7] };
+    let col_ord: [usize; 8] = if flipped { [7,6,5,4,3,2,1,0] } else { [0,1,2,3,4,5,6,7] };
+
+    // Precomputed blank line and underline for cells
+    let blank_line: String = " ".repeat(CELL_W);
+    let mid = CELL_H / 2;
+    let coord_labels: Vec<String> = col_ord.iter().map(|&c| format!("{:^width$}", (b'a' + c as u8) as char, width = CELL_W)).collect();
+    let bar_line: String = "─".repeat(CELL_W.saturating_sub(2));
+    let tgt_underline: String = format!("  {:─<width$}  ","",width=CELL_W.saturating_sub(4));
 
     let tgts: HashSet<(usize,usize)> = app.targets.iter().map(|m| m.to).collect();
     let king_chk = if app.gs.status==Status::Check { king_sq(&app.gs.board,app.gs.turn) } else { None };
     let last     = app.gs.history.last();
     let cur_bc   = app.to_board(app.cursor);
 
-    let sel_bg = rgb(th.select());
-    let cur_bg = rgb(th.cursor());
-    let chk_bg = Color::Rgb(180,40,40);
+    // Arrow sets for move arrows and hint arrows
+    let arrow_src: HashSet<(usize,usize)> = app.arrows.iter().map(|&(fr,_)| fr).collect();
+    let arrow_tgt: HashSet<(usize,usize)> = app.arrows.iter().map(|&(_,to)| to).collect();
+
+    let sel_bg = rgb(th.select(), th);
+    let cur_cl = rgb(th.cursor(), th);
+    let chk_bg = danger(th);
+
+    let tty = || TTY_MODE.load(Ordering::Relaxed) && matches!(th, Theme::MatteBlack | Theme::Mocha);
 
     let lm_color = |is_light: bool| {
+        if tty() { return Color::Indexed(11); } // BrightYellow last-move
         let sq = if is_light { th.squares().0 } else { th.squares().1 };
         let lm = th.last_move();
         Color::Rgb(
-            ((sq.0 as u16*2+lm.0 as u16)/3) as u8,
-            ((sq.1 as u16*2+lm.1 as u16)/3) as u8,
-            ((sq.2 as u16*2+lm.2 as u16)/3) as u8,
+            (((sq.0 as u16)+lm.0 as u16*2)/3) as u8,
+            (((sq.1 as u16)+lm.1 as u16*2)/3) as u8,
+            (((sq.2 as u16)+lm.2 as u16*2)/3) as u8,
+        )
+    };
+    let arrow_color = |is_light: bool| {
+        let sq = if is_light { th.squares().0 } else { th.squares().1 };
+        let ac = th.accent();
+        Color::Rgb(
+            (((sq.0 as u16)+ac.0 as u16*2)/3) as u8,
+            (((sq.1 as u16)+ac.1 as u16*2)/3) as u8,
+            (((sq.2 as u16)+ac.2 as u16*2)/3) as u8,
         )
     };
     // highlight_brightness: 0=square barely changes, 10=vivid neon
@@ -358,34 +480,44 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect, cell_w: usize, cell_h: usize
             Color::Rgb(r, g, b)
         } else { base }
     };
-    // Hint dot fg: starts near white at 0 (barely visible on square), vivid green at 10
-    let hint_fg = blend_color(
-        if (0usize+0usize)%2==0 { sq_l(th) } else { sq_d(th) }, // approx avg
-        (0, 255, 140)  // vivid neon green target
-    );
-    // Dot tint: blend square bg toward gold
-    let dot_tint = |is_light: bool| {
-        blend_color(if is_light { sq_l(th) } else { sq_d(th) }, (220, 200, 40))
+    // Hint dot fg: starts near square color at 0, vivid at 10
+    let to_tuple = |c: Color| -> (u8,u8,u8) {
+        match c {
+            Color::Rgb(r,g,b) => (r,g,b),
+            Color::Indexed(i) => match i {
+                0 => (0,0,0), 1 => (128,0,0), 2 => (0,128,0), 3 => (128,128,0),
+                4 => (0,0,128),5 => (128,0,128),6 => (0,128,128),7 => (192,192,192),
+                8 => (128,128,128),9 => (255,0,0),10=>(0,255,0),11=>(255,255,0),
+                12=>(0,0,255),13=>(255,0,255),14=>(0,255,255),15=>(255,255,255),
+                _ => (128,128,128),
+            },
+            _ => (0,0,0),
+        }
     };
-    // Full highlight square: blend toward bright teal
+    let hint_fg = |is_light: bool| {
+        blend_color(if is_light { sq_l(th) } else { sq_d(th) }, to_tuple(dim(th)))
+    };
+    let dot_tint = |is_light: bool| {
+        blend_color(if is_light { sq_l(th) } else { sq_d(th) }, to_tuple(warning(th)))
+    };
     let hl_color = |is_light: bool| {
-        blend_color(if is_light { sq_l(th) } else { sq_d(th) },
-            if is_light { (180, 230, 50) } else { (20, 200, 130) })
+        blend_color(if is_light { sq_l(th) } else { sq_d(th) }, to_tuple(success(th)))
     };
 
     let mut lines: Vec<Line> = vec![];
     if app.cfg.show_coords {
         let mut spans = vec![Span::raw("   ")];
-        for &c in &col_ord { spans.push(Span::styled(format!("{:^width$}",(b'a'+c as u8) as char,width=CELL_W), sty(DIM))); }
+        for label in &coord_labels { spans.push(Span::styled(label.clone(), sty(dim(th)))); }
         lines.push(Line::from(spans));
     }
 
     for &r in &row_ord {
         for line_idx in 0..CELL_H {
-            let is_mid = line_idx == CELL_H/2;
+            let is_mid = line_idx == mid;
             let mut spans: Vec<Span> = vec![];
             if app.cfg.show_coords {
-                spans.push(Span::styled(if is_mid{format!(" {} ",8-r)}else{"   ".to_string()}, sty(DIM)));
+                let coord = if is_mid { format!(" {} ", 8 - r) } else { "   ".to_string() };
+                spans.push(Span::styled(coord, sty(dim(th))));
             }
             for &c in &col_ord {
                 let is_light = (r+c)%2==0;
@@ -395,55 +527,80 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect, cell_w: usize, cell_h: usize
                 let is_kchk  = king_chk==Some((r,c));
                 let is_cur   = cur_bc==(r,c);
                 let is_last  = !is_sel&&!is_kchk&&last.map(|h|h.from==(r,c)||h.to==(r,c)).unwrap_or(false);
+                let is_arrow = (arrow_src.contains(&(r,c)) || arrow_tgt.contains(&(r,c))) && !is_last && !is_sel && !is_kchk && !is_tgt;
 
                 let bg = if is_sel       { sel_bg }
                     else if is_kchk      { chk_bg }
-                    else if is_cur       { cur_bg }
                     else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Highlight) { hl_color(is_light) }
                 // Dots mode: tint the square background slightly so dot stands out
-                else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) && piece.is_none() {
+                else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) {
                     dot_tint(is_light)
                 }
                     else if is_last      { lm_color(is_light) }
+                    else if is_arrow     { arrow_color(is_light) }
                     else if is_light     { sq_l(th) }
                     else                 { sq_d(th) };
 
-                let use_blocks = matches!(app.cfg.piece_style, PieceStyle::Blocks)
-                    || (CELL_W >= 6 && !matches!(app.cfg.piece_style, PieceStyle::Letters | PieceStyle::FatLetters));
+                let use_blocks = app.cfg.piece_style == PieceStyle::Ascii;
 
-                let (cell_str, mut style) = if use_blocks {
-                    let (row_str, fg) = if let Some(p) = piece {
-                        let lines = crate::pieces::render_block_lines(p, CELL_W, CELL_H);
-                        let row_str = lines.get(line_idx).cloned().unwrap_or_else(|| " ".repeat(CELL_W));
+                let is_white = piece.map(|p| p.c == PC::White).unwrap_or(false);
+                let bold = if is_white { Modifier::BOLD } else { Modifier::empty() };
+
+                let (cell_str, style) = if use_blocks {
+                    let (row_str, fg) = if is_cur && (line_idx == 0 || line_idx == CELL_H - 1) {
+                        (center_str("─", CELL_W), cur_cl)
+                    } else if is_tgt && piece.is_some() && matches!(app.cfg.move_hints,MoveHints::Dots) && line_idx == 0 {
+                        (center_str("○", CELL_W), hint_fg(is_light))
+                    } else if let Some(p) = piece {
+                        let lines = crate::pieces::render_star_lines(p, CELL_W, CELL_H);
+                        let row_str = lines.get(line_idx).cloned().unwrap_or_else(|| blank_line.clone());
                         let fg  = if p.c == PC::White { pw(th) } else { pb_c(th) };
                         (row_str, fg)
-                    } else if is_tgt && matches!(app.cfg.move_hints, MoveHints::Dots) && line_idx == CELL_H/2 {
-                        (center_str("⬤", CELL_W), hint_fg)
+                    } else if is_tgt && matches!(app.cfg.move_hints, MoveHints::Dots) && line_idx == mid {
+                        (center_str("⬤", CELL_W), hint_fg(is_light))
                     } else {
-                        (" ".repeat(CELL_W), bg)
+                        (blank_line.clone(), bg)
                     };
-                    (row_str, Style::default().bg(bg).fg(fg).add_modifier(Modifier::BOLD))
+                    (row_str, Style::default().bg(bg).fg(fg).add_modifier(bold))
                 } else {
-                    // Classic: piece symbol on middle line only
-                    let s = if is_mid {
-                        if let Some(p) = piece { center_str(&piece_sym(p,&app.cfg.piece_style), CELL_W) }
-                        else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) { center_str("⬤", CELL_W) }
-                        else { " ".repeat(CELL_W) }
-                    } else if line_idx==CELL_H-1 && is_tgt && piece.is_some() {
-                        format!("  {:─<width$}  ","",width=CELL_W.saturating_sub(4))
-                    } else { " ".repeat(CELL_W) };
-                    let mut st = Style::default().bg(bg);
-                    if let Some(p) = piece {
-                        st = st.fg(if p.c==PC::White{pw(th)}else{pb_c(th)}).add_modifier(Modifier::BOLD);
-                    } else if is_tgt {
-                        st = st.fg(hint_fg).add_modifier(Modifier::BOLD);
-                    }
+                    // Classic: piece symbol on middle line, decorative bars for Unicode
+                    let (s, st) = if is_cur && line_idx == 0 {
+                        let bar = &bar_line;
+                        (format!(" {} ", bar), Style::default().bg(bg).fg(cur_cl))
+                    } else if is_tgt && piece.is_some() && matches!(app.cfg.move_hints,MoveHints::Dots) && line_idx == 0 {
+                        (center_str("○", CELL_W), Style::default().bg(bg).fg(hint_fg(is_light)))
+                    } else if let Some(p) = piece {
+                        let sym = piece_sym(p);
+                        let pc = if p.c == PC::White { pw(th) } else { pb_c(th) };
+                        let is_unicode = matches!(app.cfg.piece_style, PieceStyle::Unicode);
+                        if is_mid {
+                            (center_str(&sym, CELL_W), Style::default().bg(bg).fg(pc).add_modifier(bold))
+                        } else if is_unicode && CELL_H >= 4 && (line_idx == mid - 1 || line_idx == mid + 1) {
+                            let bar = &bar_line;
+                            (format!(" {} ", bar), Style::default().bg(bg).fg(pc).add_modifier(Modifier::DIM))
+                        } else if line_idx == CELL_H - 1 {
+                            let bcl = if is_cur { cur_cl } else { pc };
+                            (tgt_underline.clone(), Style::default().bg(bg).fg(bcl).add_modifier(if is_cur { Modifier::BOLD } else { Modifier::DIM }))
+                        } else {
+                            (blank_line.clone(), Style::default().bg(bg))
+                        }
+                    } else if is_cur && line_idx == CELL_H - 1 {
+                        let bar = &bar_line;
+                        (format!(" {} ", bar), Style::default().bg(bg).fg(cur_cl))
+                    } else if is_tgt && matches!(app.cfg.move_hints,MoveHints::Dots) && is_mid {
+                        (center_str("⬤", CELL_W), Style::default().bg(bg).fg(hint_fg(is_light)))
+                    } else if line_idx==CELL_H-1 && is_tgt {
+                        let st = if is_cur { Style::default().bg(bg).fg(cur_cl) } else { Style::default().bg(bg) };
+                        (tgt_underline.clone(), st)
+                    } else {
+                        (blank_line.clone(), Style::default().bg(bg))
+                    };
                     (s, st)
                 };
                 spans.push(Span::styled(cell_str, style));
             }
             if app.cfg.show_coords {
-                spans.push(Span::styled(if is_mid{format!(" {} ",8-r)}else{"   ".to_string()}, sty(DIM)));
+                spans.push(Span::styled(if is_mid{format!(" {} ",8-r)}else{"   ".to_string()}, sty(dim(th))));
             }
             lines.push(Line::from(spans));
         }
@@ -451,7 +608,7 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect, cell_w: usize, cell_h: usize
 
     if app.cfg.show_coords {
         let mut spans = vec![Span::raw("   ")];
-        for &c in &col_ord { spans.push(Span::styled(format!("{:^width$}",(b'a'+c as u8) as char,width=CELL_W), sty(DIM))); }
+        for &c in &col_ord { spans.push(Span::styled(format!("{:^width$}",(b'a'+c as u8) as char,width=CELL_W), sty(dim(th)))); }
         lines.push(Line::from(spans));
     }
 
@@ -465,17 +622,21 @@ fn draw_board(app: &App, f: &mut Frame, area: Rect, cell_w: usize, cell_h: usize
     );
 }
 
-fn piece_sym(p: crate::engine::Piece, style: &PieceStyle) -> String {
-    let letter = match p.k { Kind::K=>'K',Kind::Q=>'Q',Kind::R=>'R',Kind::B=>'B',Kind::N=>'N',Kind::P=>'P' };
-    style.render(p.sym(), letter, p.c==PC::White)
+fn piece_sym(p: crate::engine::Piece) -> String {
+    p.sym().to_string()
 }
 
 fn center_str(s: &str, w: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    if len >= w { return chars.iter().take(w).collect(); }
-    let pad = w-len; let left = pad/2;
-    format!("{}{}{}", " ".repeat(left), s, " ".repeat(pad-left))
+    let len = s.chars().count();
+    if len >= w { return s.chars().take(w).collect(); }
+    let pad = w - len;
+    let left = pad / 2;
+    let right = pad - left;
+    let mut out = String::with_capacity(w);
+    for _ in 0..left { out.push(' '); }
+    out.push_str(s);
+    for _ in 0..right { out.push(' '); }
+    out
 }
 
 // ── INPUT ─────────────────────────────────────────────────────────────────────
@@ -489,22 +650,25 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
     let dm_hint  = if let Some(msg)=&app.draw_offer_msg { format!("  {}", msg) } else { String::new() };
 
     let (input_line, input_col) = if !app.input_buf.is_empty() {
-        (format!("  [{}]  {}{}█", cur_name, sel_str, app.input_buf), CREAM)
+        (format!(" [{}] {}{}█", cur_name, sel_str, app.input_buf), cream())
     } else if app.selected.is_some() {
-        (format!("  [{}]  {}navigate to target + Enter", cur_name, sel_str), TEAL)
+        (format!(" [{}] {}target + Enter", cur_name, sel_str), info(th))
     } else {
-        (format!("  [{}]  type move (e2e4 · Nf3 · O-O) or navigate{}", cur_name, dm_hint), DIM)
+        (format!(" [{}] type move or navigate{}", cur_name, dm_hint), dim(th))
     };
 
+    let is_online = matches!(app.screen, Screen::OnlineGame);
     let (hint_line, hint_col) = if let Some(err)=&app.input_err {
-        (format!("  ✗  {}", err), RED)
+        (format!(" ✗ {}", err), danger(th))
     } else if !app.input_buf.is_empty() {
-        ("  Enter execute  ·  Esc cancel  ·  Backspace delete".to_string(), DIMMER)
+        (" Enter=exec  Esc=cancel  Del=pop".to_string(), dimmer())
+    } else if is_online {
+        (" arrows  a=abort  c=chat  d=draw  t=takeback  v=claim  x=resign".to_string(), dimmer())
     } else {
-        ("  arrows/hjkl  ·  letter=notation  ·  Shift+E=PNG  ·  d=draw  ·  r=replay".to_string(), DIMMER)
+        (" arrows  E=PNG  F=FEN  d=draw  e=hints  u=undo  r=redo  q=menu".to_string(), dimmer())
     };
 
-    let border_col = if !app.input_buf.is_empty(){ac(th)} else if app.input_err.is_some(){RED} else {DIM};
+    let border_col = if !app.input_buf.is_empty(){ac(th)} else if app.input_err.is_some(){danger(th)} else {dim(th)};
     f.render_widget(
         Paragraph::new(vec![
             Line::from(vec![Span::styled(input_line, sty(input_col).add_modifier(Modifier::BOLD))]),
@@ -518,147 +682,162 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
 }
 
 // ── SIDEBAR ───────────────────────────────────────────────────────────────────
-fn draw_sidebar(app: &App, f: &mut Frame, area: Rect) {
-    match app.cfg.ui_mode {
-        UiMode::Minimal => {
-            let [pl, st, hi, kb] = Layout::vertical([
-                Constraint::Length(7), Constraint::Length(5),
-                Constraint::Fill(1),   Constraint::Length(8),
-            ]).areas(area);
-            draw_players(app, f, pl);
-            draw_status(app, f, st);
-            draw_history(app, f, hi);
-            draw_keybinds(app, f, kb);
-        }
-        UiMode::Standard => {
-            let [pl, st, an, hi, kb] = Layout::vertical([
-                Constraint::Length(7), Constraint::Length(5),
-                Constraint::Length(5), Constraint::Fill(1),
-                Constraint::Length(8),
-            ]).areas(area);
-            draw_players(app, f, pl);
-            draw_status(app, f, st);
-            draw_analysis_mini(app, f, an);
-            draw_history(app, f, hi);
-            draw_keybinds(app, f, kb);
-        }
-        UiMode::Analysis => {
-            let [pl, st, an, hi, kb] = Layout::vertical([
-                Constraint::Length(7), Constraint::Length(5),
-                Constraint::Length(7), Constraint::Fill(1),
-                Constraint::Length(8),
-            ]).areas(area);
-            draw_players(app, f, pl);
-            draw_status(app, f, st);
-            draw_analysis_full(app, f, an);
-            draw_history(app, f, hi);
-            draw_keybinds(app, f, kb);
-        }
-    }
-}
-
 fn panel_block(title: &'static str, th: Theme) -> Block<'static> {
     Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
         .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
         .title(Span::styled(format!(" {} ", title), sty(ac(th))))
 }
 
-fn draw_players(app: &App, f: &mut Frame, area: Rect) {
-    let th  = app.cfg.theme;
+fn divider_line(label: &str, th: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" ─ ", sty(dimmer())),
+        Span::styled(label.to_string(), sty(dim(th))),
+        Span::styled(" ─", sty(dimmer())),
+    ])
+}
+
+fn draw_sidebar(app: &App, f: &mut Frame, area: Rect) {
+    let th = app.cfg.theme;
+    let mut lines: Vec<Line> = vec![];
+
+    // ── PLAYERS section ──
     let iw  = app.gs.turn == PC::White;
     let ib  = app.gs.turn == PC::Black;
-    let cap_w: String = app.gs.cap_w.iter().map(|p| p.sym()).collect::<Vec<_>>().join("");
-    let cap_b: String = app.gs.cap_b.iter().map(|p| p.sym()).collect::<Vec<_>>().join("");
-    let w_tag = match app.mode { Mode::CPU if app.player_color==PC::White=>"[YOU]", Mode::CPU=>"[CPU]", _=>"" };
-    let b_tag = match app.mode { Mode::CPU if app.player_color==PC::Black=>"[YOU]", Mode::CPU=>"[CPU]", _=>"" };
-
-    // Material advantage (+N shown next to the leading side)
+    let is_online = matches!(app.screen, Screen::OnlineGame | Screen::OnlineLobby);
+    let w_tag = if is_online {
+        if app.player_color == PC::White { format!("[{}]", app.player_name) } else { app.lichess_opponent.as_ref().map(|o| format!("[{o}]")).unwrap_or_default() }
+    } else { match app.mode { Mode::Cpu if app.player_color==PC::White=>"[YOU]".into(), Mode::Cpu=>"[CPU]".into(), _=>String::new() } };
+    let b_tag = if is_online {
+        if app.player_color == PC::Black { format!("[{}]", app.player_name) } else { app.lichess_opponent.as_ref().map(|o| format!("[{o}]")).unwrap_or_default() }
+    } else { match app.mode { Mode::Cpu if app.player_color==PC::Black=>"[YOU]".into(), Mode::Cpu=>"[CPU]".into(), _=>String::new() } };
     let piece_val = |k: Kind| -> i32 {
         match k { Kind::P=>1, Kind::N=>3, Kind::B=>3, Kind::R=>5, Kind::Q=>9, Kind::K=>0 }
     };
     let mat_w: i32 = app.gs.cap_w.iter().map(|p| piece_val(p.k)).sum();
     let mat_b: i32 = app.gs.cap_b.iter().map(|p| piece_val(p.k)).sum();
-    let adv_w = mat_w - mat_b;
-    let adv_str = |adv: i32| if adv > 0 { format!("+{}", adv) } else { String::new() };
-
+    let adv_str = |adv: i32| -> String { if adv > 0 { format!("+{}", adv) } else { String::new() } };
     let clock_col = |ms_opt: Option<u64>, active: bool| -> Color {
         match ms_opt {
-            None    => if active{TEAL}else{DIMMER},
-            Some(m) if m<30_000 => RED,
-            Some(_) if active   => TEAL,
-            _                   => DIMMER,
+            None    => if active { info(th) } else { dimmer() },
+            Some(m) if m<30_000 => danger(th),
+            Some(_) if active   => info(th),
+            _                   => dimmer(),
         }
     };
     let flagged = app.gs.clock_state == ClockState::Flagged;
     let wtime   = Gs::fmt_time(app.gs.white_ms);
     let btime   = Gs::fmt_time(app.gs.black_ms);
-    let wcol    = if flagged&&!iw{RED}else{clock_col(app.gs.white_ms,iw)};
-    let bcol    = if flagged&& iw{RED}else{clock_col(app.gs.black_ms,ib)};
+    let wcol    = if flagged&&!iw{danger(th)}else{clock_col(app.gs.white_ms,iw)};
+    let bcol    = if flagged&& iw{danger(th)}else{clock_col(app.gs.black_ms,ib)};
     let has_clk = app.gs.white_ms.is_some();
+    let cap_w = sorted_captures(&app.gs.cap_w);
+    let cap_b = sorted_captures(&app.gs.cap_b);
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(if ib{"▶ "}else{"  "}, sty(ac(th))),
-            Span::styled("♚ BLACK ", sty(DIM).add_modifier(Modifier::BOLD)),
-            Span::styled(b_tag, sty(DIMMER)),
-            Span::styled(format!("{:<4}", adv_str(-adv_w)), sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(if has_clk{format!("{:>6}",btime.trim())}else{String::new()},
-                sty(bcol).add_modifier(if ib&&has_clk{Modifier::BOLD}else{Modifier::empty()})),
-        ]),
-        Line::from(vec![Span::raw("  "), Span::styled(if cap_w.is_empty(){"  —"}else{&cap_w}, sty(DIM))]),
-        Line::from(vec![Span::styled(format!("  {:─<28}",""), sty(DIMMER))]),
-        Line::from(vec![
-            Span::styled(if iw{"▶ "}else{"  "}, sty(ac(th))),
-            Span::styled("♔ WHITE ", sty(pw(th)).add_modifier(Modifier::BOLD)),
-            Span::styled(w_tag, sty(DIMMER)),
-            Span::styled(format!("{:<4}", adv_str(adv_w)), sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(if has_clk{format!("{:>6}",wtime.trim())}else{String::new()},
-                sty(wcol).add_modifier(if iw&&has_clk{Modifier::BOLD}else{Modifier::empty()})),
-        ]),
-        Line::from(vec![Span::raw("  "), Span::styled(if cap_b.is_empty(){"  —"}else{&cap_b}, sty(CREAM))]),
-    ];
-    f.render_widget(Paragraph::new(lines).block(panel_block("PLAYERS", th)), area);
-}
+    lines.push(Line::from(vec![
+        Span::styled(if iw{"▶"}else{" "}, sty(ac(th))),
+        Span::styled(" ♔ WHITE ", sty(pw(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(w_tag, sty(dimmer())),
+        Span::styled(format!(" {:<3}", adv_str(mat_b - mat_w)), sty(success(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(if has_clk{wtime.trim().to_string()}else{String::new()},
+            Style::default().fg(wcol).add_modifier(if iw&&has_clk{Modifier::BOLD}else{Modifier::empty()})),
+    ]));
+    lines.push(Line::from(vec![Span::raw(" "), Span::styled(&cap_b, sty(dim(th)))]));
+    lines.push(Line::from(vec![
+        Span::styled(if ib{"▶"}else{" "}, sty(ac(th))),
+        Span::styled(" ♚ BLACK ", sty(dim(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(b_tag, sty(dimmer())),
+        Span::styled(format!(" {:<3}", adv_str(mat_w - mat_b)), sty(success(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(if has_clk{btime.trim().to_string()}else{String::new()},
+            Style::default().fg(bcol).add_modifier(if ib&&has_clk{Modifier::BOLD}else{Modifier::empty()})),
+    ]));
+    lines.push(Line::from(vec![Span::raw(" "), Span::styled(&cap_w, sty(dim(th)))]));
 
-fn draw_status(app: &App, f: &mut Frame, area: Rect) {
-    let th = app.cfg.theme;
-    let (s, col) = status_str(app);
+    // ── STATUS section ──
+    lines.push(divider_line("status", th));
+    let (s, col) = status_str(app, th);
     let clock   = if app.cfg.show_clock { format!(" Move {}  ", app.gs.fullmove) } else { String::new() };
     let last_mv = app.gs.history.last().map(|h| {
         let who = if h.color==PC::White{"W"}else{"B"};
         format!("  last: [{}] {}", who, h.san)
     }).unwrap_or_default();
+    lines.push(Line::from(vec![Span::raw(" "), Span::styled(&s, sty(col))]));
+    lines.push(Line::from(vec![Span::styled(format!("{}{}", clock, last_mv), sty(dim(th)))]));
 
-    let info_line = if app.png_notice.is_some() {
-        let path  = app.png_export_path.as_deref().unwrap_or("");
-        let fname = path.split('/').last().unwrap_or(path);
-        (format!("  + PNG saved: {}", fname), GREEN)
-    } else if app.pgn_notice.is_some() {
-        let path  = app.pgn_saved_path.as_deref().unwrap_or("");
-        let fname = path.split('/').last().unwrap_or(path);
-        (format!("  + PGN saved: {}", fname), TEAL)
-    } else {
-        (String::new(), DIMMER)
+    // ── EVAL/ANALYSIS section ──
+    let (rev_title, rev_lines) = match app.cfg.ui_mode {
+        UiMode::Standard => {
+            let busy  = if app.engine_busy { "~" } else { "+" };
+            let eng   = trunc(&app.analysis.engine_name, 14);
+            let title = format!(" eval {} [{}] ", busy, eng);
+            let an_lines: Vec<Line> = if let Some(rev) = app.move_reviews.last() {
+                let lc = label_color(rev.label, th);
+                vec![
+                    Line::from(vec![
+                        Span::styled(format!(" [{}]", rev.label.icon()), sty(lc)),
+                        Span::styled(format!(" {:.2}p", rev.delta_cp as f32 / 100.0), sty(lc)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Best: ", sty(dimmer())),
+                        Span::styled(trunc(rev.best_move.as_deref().unwrap_or("--"), 8), sty(dim(th))),
+                        Span::styled(format!(" {:.1}", rev.eval_after / 100.0), sty(dim(th))),
+                    ]),
+                ]
+            } else if app.thinking {
+                vec![Line::from(vec![Span::styled("  analysing...", sty(dimmer()))])]
+            } else {
+                vec![Line::from(vec![Span::styled("  make a move to analyse", sty(dimmer()))])]
+            };
+            (title, an_lines)
+        }
+        UiMode::Analysis => {
+            let busy  = if app.engine_busy { "~" } else { "+" };
+            let eng   = trunc(&app.analysis.engine_name, 14);
+            let title = format!(" analysis {} [{}] ", busy, eng);
+            let an_lines: Vec<Line> = if let Some(rev) = app.move_reviews.last() {
+                let lc = label_color(rev.label, th);
+                vec![
+                    Line::from(vec![Span::styled(format!(" Move: {}", rev.san), sty(cream()).add_modifier(Modifier::BOLD))]),
+                    Line::from(vec![
+                        Span::styled(" Label: ", sty(dimmer())),
+                        Span::styled(format!("[{}] {}", rev.label.icon(), rev.label.name()), sty(lc)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" Delta: ", sty(dimmer())),
+                        Span::styled(format!("{:.2}p", rev.delta_cp as f32 / 100.0),
+                            sty(if rev.delta_cp < -300 { danger(th) } else if rev.delta_cp < -100 { warning(th) } else { success(th) })),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" Eval: ", sty(dimmer())),
+                        Span::styled(format!("{:.1} → {:.1}", rev.eval_before / 100.0, rev.eval_after / 100.0), sty(dim(th))),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(" Best: ", sty(dimmer())),
+                        Span::styled(trunc(rev.best_move.as_deref().unwrap_or("--"), 8), sty(info(th))),
+                        Span::styled(format!(" {:.1}", rev.eval_after / 100.0), sty(dim(th))),
+                    ]),
+                ]
+            } else if app.thinking {
+                vec![Line::from(vec![Span::styled("  analysing...", sty(dimmer()))])]
+            } else {
+                vec![Line::from(vec![Span::styled("  make a move to analyse", sty(dimmer()))])]
+            };
+            (title, an_lines)
+        }
+        UiMode::Minimal => (String::new(), vec![]),
     };
+    if !rev_lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(" ─ ", sty(dimmer())),
+            Span::styled(rev_title.trim().to_string(), sty(dim(th))),
+            Span::styled(" ─", sty(dimmer())),
+        ]));
+        lines.extend(rev_lines);
+    }
 
-    let lines = vec![
-        Line::from(vec![Span::raw(" "), Span::styled(&s, sty(col).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![Span::styled(format!("{}{}", clock, last_mv), sty(DIM))]),
-        Line::from(vec![Span::styled(info_line.0, sty(info_line.1))]),
-        Line::from(vec![Span::styled(
-            if !app.undo_stack.is_empty() { format!("  {} undo available", app.undo_stack.len()) } else { String::new() },
-            sty(DIMMER),
-        )]),
-    ];
-    f.render_widget(Paragraph::new(lines).block(panel_block("STATUS", th)), area);
-}
-
-fn draw_history(app: &App, f: &mut Frame, area: Rect) {
-    let th  = app.cfg.theme;
+    // ── HISTORY section ──
+    lines.push(divider_line("moves", th));
     let h   = &app.gs.history;
-    let cap = area.height.saturating_sub(2) as usize;
-
-    let mut pairs: Vec<(usize,String,String,bool,bool,Option<MoveLabel>,Option<MoveLabel>)> = vec![];
+    let mut pairs: Vec<MovePair> = vec![];
     let mut i = 0; let mut n = 1;
     let last_idx = h.len().saturating_sub(1);
     while i < h.len() {
@@ -671,69 +850,100 @@ fn draw_history(app: &App, f: &mut Frame, area: Rect) {
         pairs.push((n, w, b, w_last, b_last, wlabel, blabel));
         i += 2; n += 1;
     }
-
+    let cap = area.height.saturating_sub(3) as usize;
     let start = pairs.len().saturating_sub(cap);
-    let mut lines: Vec<Line> = vec![];
     if pairs.is_empty() {
-        lines.push(Line::from(vec![Span::styled(" — no moves yet —", sty(DIMMER))]));
+        lines.push(Line::from(vec![Span::styled("  — no moves yet —", sty(dimmer()))]));
     } else {
         for (n, w, b, wl, bl, wlab, blab) in &pairs[start..] {
             let w_sty = if *wl {
                 Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)
-            } else { sty(CREAM).add_modifier(Modifier::BOLD) };
+            } else { sty(cream()).add_modifier(Modifier::BOLD) };
             let b_sty = if *bl {
-                Style::default().fg(bg0(th)).bg(Color::Rgb(80,180,140)).add_modifier(Modifier::BOLD)
-            } else { sty(DIM) };
-            let wlc = wlab.map(|l| label_color(l, th)).unwrap_or(DIMMER);
-            let blc = blab.map(|l| label_color(l, th)).unwrap_or(DIMMER);
+                Style::default().fg(bg0(th)).bg(info(th)).add_modifier(Modifier::BOLD)
+            } else { sty(dim(th)) };
+            let wlc = wlab.map(|l| label_color(l, th)).unwrap_or(dimmer());
+            let blc = blab.map(|l| label_color(l, th)).unwrap_or(dimmer());
             let wi  = wlab.map(|l| l.icon()).unwrap_or("");
             let bi  = blab.map(|l| l.icon()).unwrap_or("");
-            // Format move times compactly
-            let wt = app.gs.history.get(i).map(|h| fmt_move_time(h.move_time_ms)).unwrap_or_default();
-            let bt = app.gs.history.get(i+1).map(|h| fmt_move_time(h.move_time_ms)).unwrap_or_default();
             lines.push(Line::from(vec![
-                Span::styled(format!(" {:>3}. ", n), sty(DIMMER)),
-                Span::styled(format!("{:<8}", w), w_sty),
-                Span::styled(format!("{:<3}", wi), sty(wlc)),
-                Span::styled(format!("{:<4} ", wt), sty(DIMMER)),
-                Span::styled(format!("{:<8}", b), b_sty),
-                Span::styled(format!("{:<3}", bi), sty(blc)),
+                Span::styled(format!("{:>3}. ", n), sty(dimmer())),
+                Span::styled(format!("{:<7}", w), w_sty),
+                Span::styled(format!("{:<2}", wi), sty(wlc)),
+                Span::raw(" "),
+                Span::styled(format!("{:<7}", b), b_sty),
+                Span::styled(format!("{:<2}", bi), sty(blc)),
             ]));
         }
     }
-    f.render_widget(Paragraph::new(lines).block(panel_block("HISTORY", th)), area);
-}
 
-fn draw_keybinds(app: &App, f: &mut Frame, area: Rect) {
-    let th = app.cfg.theme;
+    // ── KEYS section ──
+    lines.push(divider_line("keys", th));
     let mode_label = match app.cfg.ui_mode {
         UiMode::Minimal  => "min",
         UiMode::Standard => "std",
         UiMode::Analysis => "ana",
     };
-    let lines = vec![
-        Line::from(vec![Span::styled(" ↑↓←→ / hjkl   move cursor", sty(DIM))]),
-        Line::from(vec![Span::styled(" Enter / Spc    select & move", sty(DIM))]),
-        Line::from(vec![Span::styled(" mouse click    select & move", sty(DIM))]),
-        Line::from(vec![Span::styled(" any letter     type notation", sty(DIM))]),
-        Line::from(vec![
-            Span::styled(" E ", sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(" PNG  ", sty(DIM)),
-            Span::styled(" G ", sty(TEAL).add_modifier(Modifier::BOLD)),
-            Span::styled(" PGN  ", sty(DIM)),
-            Span::styled(" T ", sty(AMBER).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" mode[{}]", mode_label), sty(DIM)),
-        ]),
-        Line::from(vec![Span::styled(" d  draw  u  undo  r  replay", sty(DIM))]),
-        Line::from(vec![Span::styled(" n  new   s  settings  q  menu", sty(DIM))]),
-    ];
-    f.render_widget(Paragraph::new(lines).block(panel_block("KEYS", th)), area);
+    lines.push(Line::from(vec![Span::styled(" ↑↓←→/hjkl cursor   Enter/click move", sty(dim(th)))]));
+    lines.push(Line::from(vec![
+        Span::styled(" E", sty(success(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(":PNG", sty(dim(th))),
+        Span::styled(" G", sty(info(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(":PGN", sty(dim(th))),
+        Span::styled(" T", sty(warning(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(":{}", mode_label), sty(dim(th))),
+        Span::styled(" d", sty(dim(th))),
+        Span::styled(":draw", sty(dimmer())),
+        Span::styled(" u", sty(dim(th))),
+        Span::styled(":undo", sty(dimmer())),
+        Span::styled(" r", sty(dim(th))),
+        Span::styled(":redo", sty(dimmer())),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" n", sty(dim(th))),
+        Span::styled(":new  ", sty(dimmer())),
+        Span::styled(" e", sty(dim(th))),
+        Span::styled(":hints  ", sty(dimmer())),
+        Span::styled(" s", sty(dim(th))),
+        Span::styled(":settings  ", sty(dimmer())),
+        Span::styled(" q", sty(dim(th))),
+        Span::styled(":menu  ", sty(dimmer())),
+        Span::styled(" type", sty(dim(th))),
+        Span::styled(":notation", sty(dimmer())),
+    ]));
+
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+                .title(Span::styled(" SIDEBAR ", sty(ac(th))))
+        ),
+        area,
+    );
 }
+
+fn sorted_captures(captured: &[Piece]) -> String {
+    let order = [Kind::Q, Kind::R, Kind::B, Kind::N, Kind::P];
+    let mut counts: [usize; 5] = [0; 5];
+    for p in captured {
+        for (i, &k) in order.iter().enumerate() {
+            if p.k == k { counts[i] += 1; break; }
+        }
+    }
+    let mut out = String::new();
+    for (i, &k) in order.iter().enumerate() {
+        let sym = Piece { k, c: PC::White }.sym();
+        for _ in 0..counts[i] { out.push_str(sym); }
+    }
+    if out.is_empty() { "  —".to_string() } else { format!(" {}", out) }
+}
+
+// (dead panel functions removed — sidebar is now a single block with dividers)
 
 // ── GAME OVER OVERLAY ─────────────────────────────────────────────────────────
 fn draw_gameover(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
-    let rect = center(54, 16, f.area());
+    let rect = center(52, 16, f.area());
     f.render_widget(Clear, rect);
 
     let flagged = app.gs.clock_state == ClockState::Flagged;
@@ -741,76 +951,89 @@ fn draw_gameover(app: &App, f: &mut Frame) {
 
     let (title, title_col, body) = if flagged {
         let loser = app.gs.turn.name(); let winner = app.gs.turn.opp().name();
-        ("  ⏰  FLAG FALL  ⏰".to_string(), RED,
-         vec![format!("  {} ran out of time!", loser), format!("  {} wins on time.", winner)])
+        ("  FLAG FALL".to_string(), danger(th),
+         vec![format!("{} ran out of time.", loser), format!("{} wins.", winner)])
     } else if is_draw {
-        ("  ½  DRAW AGREED  ½".to_string(), AMBER,
-         vec!["  The game is drawn.".to_string(), "  Both players agreed.".to_string()])
+        ("  DRAW".to_string(), warning(th),
+         vec!["Game drawn by agreement.".to_string()])
     } else {
         match app.gs.status {
             Status::Checkmate => {
                 let w=app.gs.turn.opp().name(); let l=app.gs.turn.name();
-                ("  ♛  CHECKMATE  ♛".to_string(), Color::Rgb(210,175,60),
-                 vec![format!("  {} wins!", w), format!("  {} king is mated.", l)])
+                ("  CHECKMATE".to_string(), warning(th),
+                 vec![format!("{} wins!", w), format!("{} king is mated.", l)])
             }
             Status::Stalemate => (
-                "  ½  STALEMATE  ½".to_string(), AMBER,
-                vec!["  The game is drawn.".to_string(), "  No legal moves — stalemate.".to_string()]),
+                "  STALEMATE".to_string(), warning(th),
+                vec!["Game drawn.".to_string(), "No legal moves.".to_string()]),
             _ => return,
         }
     };
 
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(title_col)).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(&title, sty(title_col).add_modifier(Modifier::BOLD))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
-    let total  = (app.gs.history.len()+1) / 2;
-
-    let save_line = if app.png_notice.is_some() {
-        let path = app.png_export_path.as_deref().unwrap_or("");
-        (format!("  + PNG saved: {}", path.split('/').last().unwrap_or(path)), GREEN)
-    } else if app.pgn_notice.is_some() {
-        let path = app.pgn_saved_path.as_deref().unwrap_or("");
-        (format!("  + PGN saved: {}", path.split('/').last().unwrap_or(path)), TEAL)
-    } else if let Some(p) = &app.pgn_saved_path {
-        (format!("  PGN: {}", p.split('/').last().unwrap_or(p)), TEAL)
-    } else {
-        (String::new(), DIMMER)
-    };
+    let total  = app.gs.history.len().div_ceil(2);
 
     let fen = app.current_fen();
     let fen_display = if fen.len() > 46 { format!("{}…", &fen[..45]) } else { fen };
 
+    let piece_val = |k: Kind| -> i32 {
+        match k { Kind::P=>1, Kind::N=>3, Kind::B=>3, Kind::R=>5, Kind::Q=>9, Kind::K=>0 }
+    };
+    let mat_w: i32 = app.gs.cap_w.iter().map(|p| piece_val(p.k)).sum();
+    let mat_b: i32 = app.gs.cap_b.iter().map(|p| piece_val(p.k)).sum();
+    let diff = (mat_w as i16 - mat_b as i16).abs() as i32;
+    let mat_line = if diff > 0 {
+        let side = if mat_w > mat_b { "White" } else { "Black" };
+        format!("Material: {} up +{}", side, diff)
+    } else {
+        "Material: equal".to_string()
+    };
+
+    let time_line = match (app.gs.white_ms, app.gs.black_ms) {
+        (Some(w), Some(b)) => {
+            let total_ms = w + b;
+            let secs = total_ms / 1000;
+            let mins = secs / 60; let secs = secs % 60;
+            format!("Time: {}m {:02}s", mins, secs)
+        }
+        _ => String::new(),
+    };
+
     let mut lines = vec![Line::from("")];
     for b in &body {
-        lines.push(Line::from(vec![Span::styled(b.as_str(), sty(CREAM).add_modifier(Modifier::BOLD))]));
+        lines.push(Line::from(vec![Span::styled(b, sty(cream()))]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(format!("  {} moves played", total), sty(DIM))]));
-    lines.push(Line::from(vec![Span::styled(format!("  {}", fen_display), sty(DIMMER))]));
-    if !save_line.0.is_empty() {
-        lines.push(Line::from(vec![Span::styled(&save_line.0, sty(save_line.1))]));
+    lines.push(Line::from(vec![Span::styled(format!(" {} moves", total), sty(dim(th)))]));
+    lines.push(Line::from(vec![Span::styled(format!(" {}", mat_line), sty(dim(th)))]));
+    if !time_line.is_empty() {
+        lines.push(Line::from(vec![ Span::styled(format!(" {}", time_line), sty(dim(th)))]));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(format!("  {:─<46}",""), sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled(format!(" {}", fen_display), sty(dimmer()))]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  n  new", sty(ac(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(" n:new", sty(ac(th)).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled("r  replay", sty(TEAL).add_modifier(Modifier::BOLD)),
+        Span::styled("r:analyze", sty(info(th)).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled("E  PNG", sty(GREEN).add_modifier(Modifier::BOLD)),
+        Span::styled("E:PNG", sty(success(th)).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled("G  PGN", sty(TEAL).add_modifier(Modifier::BOLD)),
+        Span::styled("G:PGN", sty(info(th)).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled("u  undo", sty(DIM)),
+        Span::styled("F:FEN", sty(dim(th)).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
-        Span::styled("q  menu", sty(DIM)),
+        Span::styled("u:undo", sty(dim(th))),
+        Span::raw("  "),
+        Span::styled("q:menu", sty(dim(th))),
     ]));
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(sty(title_col)).style(Style::default().bg(bg1(th)))
+                .title(Span::styled(&title, sty(title_col).add_modifier(Modifier::BOLD)))
+                .padding(Padding::new(2, 2, 1, 1)),
+        ),
+        rect,
+    );
 }
 
 // ── PNG PREVIEW OVERLAY ───────────────────────────────────────────────────────
@@ -819,21 +1042,10 @@ fn draw_png_preview(app: &App, f: &mut Frame) {
     // Popup: 56 wide, 24 tall
     let rect = center(56, 24, f.area());
     f.render_widget(Clear, rect);
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(GREEN)).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(
-                format!(" 📸  EXPORT BOARD AS PNG  — v{} ", VERSION),
-                sty(GREEN).add_modifier(Modifier::BOLD),
-            )),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
-
     let board   = &app.gs.board;
     let flipped = app.flipped();
-    let row_ord: Vec<usize> = if flipped { (0..8).rev().collect() } else { (0..8).collect() };
-    let col_ord: Vec<usize> = if flipped { (0..8).rev().collect() } else { (0..8).collect() };
+    let row_ord: [usize; 8] = if flipped { [7,6,5,4,3,2,1,0] } else { [0,1,2,3,4,5,6,7] };
+    let col_ord: [usize; 8] = if flipped { [7,6,5,4,3,2,1,0] } else { [0,1,2,3,4,5,6,7] };
 
     // Save path display
     let path_str = app.png_preview_path.as_ref()
@@ -851,11 +1063,11 @@ fn draw_png_preview(app: &App, f: &mut Frame) {
 
     // ── Mini board (compact: 2 chars per square + rank label) ─────────────
     // File label row
-    let mut file_row: Vec<Span> = vec![Span::styled("   ", sty(DIMMER))];
+    let mut file_row: Vec<Span> = vec![Span::styled("   ", sty(dimmer()))];
     for &c in &col_ord {
         file_row.push(Span::styled(
             format!("{} ", (b'a'+c as u8) as char),
-            sty(DIM),
+            sty(dim(th)),
         ));
     }
     lines.push(Line::from(file_row));
@@ -863,13 +1075,13 @@ fn draw_png_preview(app: &App, f: &mut Frame) {
     // Board rows
     for &r in &row_ord {
         let mut row_spans = vec![
-            Span::styled(format!(" {} ", 8-r), sty(DIM)),
+            Span::styled(format!(" {} ", 8-r), sty(dim(th))),
         ];
         for &c in &col_ord {
             let is_light = (r+c)%2 == 0;
             let bg_c     = if is_light { sq_l(th) } else { sq_d(th) };
             let (txt, fg) = match board[r][c] {
-                None    => ("  ".to_string(), DIMMER),
+                None    => ("  ".to_string(), dimmer()),
                 Some(p) => {
                     let fg = if p.c==PC::White { pw(th) } else { pb_c(th) };
                     (format!("{} ", p.sym()), fg)
@@ -882,37 +1094,48 @@ fn draw_png_preview(app: &App, f: &mut Frame) {
     }
 
     // File label row (bottom)
-    let mut file_row2: Vec<Span> = vec![Span::styled("   ", sty(DIMMER))];
+    let mut file_row2: Vec<Span> = vec![Span::styled("   ", sty(dimmer()))];
     for &c in &col_ord {
         file_row2.push(Span::styled(
             format!("{} ", (b'a'+c as u8) as char),
-            sty(DIM),
+            sty(dim(th)),
         ));
     }
     lines.push(Line::from(file_row2));
 
     // Save path
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled("  Save to:", sty(DIM))]));
+    lines.push(Line::from(vec![Span::styled("  Save to:", sty(dim(th)))]));
     lines.push(Line::from(vec![Span::styled(
         format!("  {}", path_display),
-        sty(GREEN).add_modifier(Modifier::BOLD),
+        sty(success(th)).add_modifier(Modifier::BOLD),
     )]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
         format!("  {:─<48}",""),
-        sty(DIMMER),
+        sty(dimmer()),
     )]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  Y / Enter  ", sty(GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled("save PNG", sty(CREAM).add_modifier(Modifier::BOLD)),
+        Span::styled("  Y / Enter  ", sty(success(th)).add_modifier(Modifier::BOLD)),
+        Span::styled("save PNG", sty(cream()).add_modifier(Modifier::BOLD)),
         Span::raw("          "),
-        Span::styled("N / Esc  ", sty(RED)),
-        Span::styled("cancel", sty(DIM)),
+        Span::styled("N / Esc  ", sty(danger(th))),
+        Span::styled("cancel", sty(dim(th))),
     ]));
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(sty(success(th))).style(Style::default().bg(bg1(th)))
+                .title(Span::styled(
+                    format!(" 📸  EXPORT BOARD AS PNG  — v{} ", VERSION),
+                    sty(success(th)).add_modifier(Modifier::BOLD),
+                ))
+                .padding(Padding::new(2, 2, 1, 1)),
+        ),
+        rect,
+    );
 }
 
 // ── DRAW OFFER OVERLAY ────────────────────────────────────────────────────────
@@ -923,26 +1146,27 @@ fn draw_draw_offer(app: &App, f: &mut Frame) {
     let offerer   = app.draw_offer.map(|c| c.name()).unwrap_or("Unknown");
     let responder = app.draw_offer.map(|c| c.opp().name()).unwrap_or("Unknown");
     f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(AMBER)).style(Style::default().bg(bg1(th)))
-            .title(Span::styled("  ½  DRAW OFFER  ½", sty(AMBER).add_modifier(Modifier::BOLD))),
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(format!("  {} offers a draw.", offerer), sty(cream()).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::styled(format!("  {}, do you accept?", responder), sty(cream()))]),
+            Line::from(""),
+            Line::from(vec![Span::styled(format!("  {:─<38}",""), sty(dimmer()))]),
+            Line::from(""),
+            Line::from(vec![Span::styled("  Y / Enter  accept draw", sty(info(th)).add_modifier(Modifier::BOLD))]),
+            Line::from(vec![Span::styled("  N / Esc    decline & keep playing", sty(danger(th)))]),
+        ]).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                .border_style(sty(warning(th))).style(Style::default().bg(bg1(th)))
+                .title(Span::styled("  ½  DRAW OFFER  ½", sty(warning(th)).add_modifier(Modifier::BOLD)))
+                .padding(Padding::new(2, 2, 1, 1)),
+        ),
         rect,
     );
-    let inner = pad(rect, 2, 1);
-    f.render_widget(Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(format!("  {} offers a draw.", offerer), sty(CREAM).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![Span::styled(format!("  {}, do you accept?", responder), sty(CREAM))]),
-        Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<38}",""), sty(DIMMER))]),
-        Line::from(""),
-        Line::from(vec![Span::styled("  Y / Enter  accept draw", sty(TEAL).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![Span::styled("  N / Esc    decline & keep playing", sty(RED))]),
-    ]), inner);
 }
 
-// ── REPLAY ────────────────────────────────────────────────────────────────────
-fn draw_replay(app: &App, f: &mut Frame) {
+// ── ANALYZE ───────────────────────────────────────────────────────────────────
+fn draw_analyze(app: &App, f: &mut Frame) {
     let th = app.cfg.theme;
     let a  = f.area();
     let cw = app.cell_w;
@@ -953,74 +1177,97 @@ fn draw_replay(app: &App, f: &mut Frame) {
     let [board_col, side_col] = Layout::horizontal([Constraint::Length(bw), Constraint::Fill(1)]).areas(body);
 
     let snap  = app.replay_snaps.get(app.replay_idx);
-    let title = format!(" ♟ RChess — REPLAY  [{}/{}]  {}",
+    let title = format!(" ♟ RChess — ANALYZE  [{}/{}]  {}",
         app.replay_idx, app.replay_snaps.len().saturating_sub(1), app.replay_result);
-    f.render_widget(Paragraph::new(title).style(Style::default().fg(TEAL).bg(bg1(th))), top);
+    f.render_widget(Paragraph::new(title).style(Style::default().fg(info(th)).bg(bg1(th))), top);
 
-    // Split board column: narrow eval bar on left, board on right
     let [eval_bar_col, actual_board_col] = Layout::horizontal([
         Constraint::Length(4),
         Constraint::Fill(1),
     ]).areas(board_col);
 
-    if let Some(snap) = snap { draw_replay_board(app, f, actual_board_col, snap); }
+    if let Some(snap) = snap { draw_analyze_board(app, f, actual_board_col, snap); }
 
-    // Draw vertical eval bar
-    let cur_eval = app.eval_history.get(app.replay_idx).copied().unwrap_or(0);
+    let cur_eval = if app.replay_idx >= app.eval_history.len()
+        && app.replay_idx == app.replay_snaps.len().saturating_sub(1)
+    {
+        // Terminal position with no engine eval — use game result for full fill
+        match app.replay_result.as_str() {
+            "1-0" => 10000,
+            "0-1" => -10000,
+            _ => 0,
+        }
+    } else {
+        app.eval_history.get(app.replay_idx).copied().unwrap_or(0)
+    };
     draw_eval_bar(cur_eval, app.engine_busy, f, eval_bar_col);
 
-    draw_replay_sidebar(app, f, side_col);
+    draw_analyze_sidebar(app, f, side_col);
 }
 
-fn draw_replay_board(app: &App, f: &mut Frame, area: Rect, snap: &ReplaySnap) {
+fn draw_analyze_board(app: &App, f: &mut Frame, area: Rect, snap: &ReplaySnap) {
     #[allow(non_snake_case)]
     let CELL_W = app.cell_w as usize;
     #[allow(non_snake_case)]
     let CELL_H = app.cell_h as usize;
     let th      = app.cfg.theme;
     let flipped = app.flipped();
-    let row_ord: Vec<usize> = if flipped{(0..8).rev().collect()}else{(0..8).collect()};
-    let col_ord: Vec<usize> = if flipped{(0..8).rev().collect()}else{(0..8).collect()};
+    let row_ord: [usize; 8] = if flipped { [7,6,5,4,3,2,1,0] } else { [0,1,2,3,4,5,6,7] };
+    let col_ord: [usize; 8] = if flipped { [7,6,5,4,3,2,1,0] } else { [0,1,2,3,4,5,6,7] };
+
+    let use_blocks = app.cfg.piece_style == PieceStyle::Ascii;
+    let blank_line: String = " ".repeat(CELL_W);
+    let mid = CELL_H / 2;
+    let coord_labels: Vec<String> = col_ord.iter().map(|&c| format!("{:^width$}", (b'a' + c as u8) as char, width = CELL_W)).collect();
+    let bar_line: String = "─".repeat(CELL_W.saturating_sub(2));
 
     let mut lines: Vec<Line> = vec![];
     if app.cfg.show_coords {
         let mut spans = vec![Span::raw("   ")];
-        for &c in &col_ord { spans.push(Span::styled(format!("{:^width$}",(b'a'+c as u8) as char,width=CELL_W), sty(DIM))); }
+        for label in &coord_labels { spans.push(Span::styled(label.clone(), sty(dim(th)))); }
         lines.push(Line::from(spans));
     }
     for &r in &row_ord {
         for line_idx in 0..CELL_H {
-            let is_mid = line_idx == CELL_H/2;
+            let is_mid = line_idx == mid;
             let mut spans: Vec<Span> = vec![];
-            if app.cfg.show_coords { spans.push(Span::styled(if is_mid{format!(" {} ",8-r)}else{"   ".to_string()}, sty(DIM))); }
+            if app.cfg.show_coords { spans.push(Span::styled(if is_mid{format!(" {} ",8-r)}else{"   ".to_string()}, sty(dim(th)))); }
             for &c in &col_ord {
                 let piece    = snap.board[r][c];
                 let is_light = (r+c)%2==0;
                 let bg = if is_light { sq_l(th) } else { sq_d(th) };
-                let cell = if is_mid {
-                    if let Some(p)=piece { center_str(&piece_sym(p,&app.cfg.piece_style),CELL_W) }
-                    else { " ".repeat(CELL_W) }
-                } else { " ".repeat(CELL_W) };
-                let mut style = Style::default().bg(bg);
-                if let Some(p)=piece {
-                    style=style.fg(if p.c==PC::White{pw(th)}else{pb_c(th)}).add_modifier(Modifier::BOLD);
-                }
-                spans.push(Span::styled(cell, style));
+                let (cell_str, style) = if let Some(p) = piece {
+                    let pc = if p.c == PC::White { pw(th) } else { pb_c(th) };
+                    if use_blocks {
+                        let blines = crate::pieces::render_star_lines(p, CELL_W, CELL_H);
+                        let row_str = blines.get(line_idx).cloned().unwrap_or_else(|| blank_line.clone());
+                        (row_str, Style::default().bg(bg).fg(pc).add_modifier(Modifier::BOLD))
+                    } else if is_mid {
+                        (center_str(&piece_sym(p),CELL_W), Style::default().bg(bg).fg(pc).add_modifier(Modifier::BOLD))
+                    } else if matches!(app.cfg.piece_style, PieceStyle::Unicode) && CELL_H >= 4 && (line_idx == mid - 1 || line_idx == mid + 1) {
+                        (format!(" {} ", bar_line), Style::default().bg(bg).fg(pc).add_modifier(Modifier::DIM))
+                    } else {
+                        (blank_line.clone(), Style::default().bg(bg))
+                    }
+                } else {
+                    (blank_line.clone(), Style::default().bg(bg))
+                };
+                spans.push(Span::styled(cell_str, style));
             }
-            if app.cfg.show_coords { spans.push(Span::styled(if is_mid{format!(" {} ",8-r)}else{"   ".to_string()}, sty(DIM))); }
+            if app.cfg.show_coords { spans.push(Span::styled(if is_mid{format!(" {} ",8-r)}else{"   ".to_string()}, sty(dim(th)))); }
             lines.push(Line::from(spans));
         }
     }
     if app.cfg.show_coords {
         let mut spans = vec![Span::raw("   ")];
-        for &c in &col_ord { spans.push(Span::styled(format!("{:^width$}",(b'a'+c as u8) as char,width=CELL_W), sty(DIM))); }
+        for label in &coord_labels { spans.push(Span::styled(label.clone(), sty(dim(th)))); }
         lines.push(Line::from(spans));
     }
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-                .border_style(sty(TEAL)).style(Style::default().bg(bg0(th)))
-                .title(Span::styled(" REPLAY ", sty(TEAL).add_modifier(Modifier::BOLD)))
+                .border_style(sty(info(th))).style(Style::default().bg(bg0(th)))
+                .title(Span::styled(" REPLAY ", sty(info(th)).add_modifier(Modifier::BOLD)))
         ),
         area,
     );
@@ -1029,94 +1276,97 @@ fn draw_replay_board(app: &App, f: &mut Frame, area: Rect, snap: &ReplaySnap) {
 
 /// Render a compact ASCII sparkline of eval history.
 /// eval_history[0] = start (0), eval_history[N] = after move N.
-/// Width = number of chars to use.
+/// Width = number of chars to use. Always B&W grayscale.
 fn eval_sparkline(eval_history: &[i32], width: usize) -> (String, Vec<Color>) {
     if eval_history.len() < 2 || width < 3 {
         return ("no data".to_string(), vec![]);
     }
-    // Sample at most `width` points
     let n = eval_history.len();
     let step = if n <= width { 1 } else { n / width };
     let samples: Vec<i32> = (0..n).step_by(step.max(1)).map(|i| eval_history[i]).collect();
     let samples = &samples[..samples.len().min(width)];
 
     let max_abs = samples.iter().map(|v| v.abs()).max().unwrap_or(1).max(50) as f32;
-    // 5 levels: ▁▂▃▄▅▆▇█  (use 4: ▁▃▅▇ for clarity)
     let bars = ["▁","▃","▅","▇","█"];
-    let mid  = 2usize; // index of zero bar
 
     let mut out = String::new();
     let mut colors = vec![];
     for &ev in samples {
-        let norm = (ev as f32 / max_abs).clamp(-1.0, 1.0); // -1..1
-        // Map to bar index 0..4 (0=deep black, 4=deep white)
+        let norm = (ev as f32 / max_abs).clamp(-1.0, 1.0);
         let idx = ((norm + 1.0) / 2.0 * 4.0).round() as usize;
         let idx = idx.min(4);
         out.push_str(bars[idx]);
-        let col = if ev > 30 {
-            Color::Rgb(120, 220, 160) // green = white better
-        } else if ev < -30 {
-            Color::Rgb(200, 70, 70)   // red = black better
-        } else {
-            Color::Rgb(110, 130, 110) // neutral
-        };
+        let col = if ev > 30 { Color::Indexed(15) } else if ev < -30 { Color::Indexed(8) } else { Color::Indexed(7) };
         colors.push(col);
     }
     (out, colors)
 }
 
 
-// ── VERTICAL EVAL BAR ─────────────────────────────────────────────────────────
-// Shows who is better — like chess.com's vertical bar on the left of the board.
-// eval_cp: White-positive centipawns. Positive = White better, Negative = Black better.
+// ── VERTICAL EVAL BAR ──────────────────────────────────────────────────────
+// Shows who is better — White-positive centipawns.
+// Bar fills completely toward the winning side (no minimum row constraint).
+// Always B&W grayscale, independent of theme.
 fn draw_eval_bar(eval_cp: i32, busy: bool, f: &mut Frame, area: Rect) {
     let total = area.height as i32;
     if total < 4 { return; }
 
-    // Clamp eval to ±10 pawns, map to 0..total (0=Black winning, total=White winning)
-    let clamped = (eval_cp.max(-1000).min(1000)) as f32 / 100.0; // -10..10
-    let frac    = ((clamped + 10.0) / 20.0).clamp(0.0, 1.0);      // 0..1
-    // White is at the BOTTOM of the bar (rank 1), Black at top
-    let white_rows = ((frac * total as f32) as i32).max(1).min(total - 1);
-    let black_rows = total - white_rows;
+    let is_mate = eval_cp.abs() >= 10_000;
+
+    // Full fill toward winning side — no minimum row constraint
+    let (white_rows, black_rows) = if is_mate {
+        if eval_cp > 0 { (total, 0) } else { (0, total) }
+    } else {
+        let clamped = (eval_cp.clamp(-1000, 1000)) as f32 / 100.0;
+        let frac    = ((clamped + 10.0) / 20.0).clamp(0.0, 1.0);
+        let wr = (frac * total as f32).round() as i32;
+        (wr.clamp(0, total), (total - wr).clamp(0, total))
+    };
 
     let mut lines: Vec<Line> = vec![];
 
-    // Black section (top)
+    // Black section (top) — pure black background, bright white text
     for i in 0..black_rows as usize {
-        let is_first = i == 0;
-        let lbl = if is_first && !busy {
-            let p = eval_cp.abs() as f32 / 100.0;
-            if eval_cp < -20 { format!("{:.1}", p) } else { " ".to_string() }
-        } else { " ".to_string() };
+        let is_mate_row = is_mate && i == 0;
+        let lbl = if is_mate_row {
+            "MATE".to_string()
+        } else if i == 0 && !busy && eval_cp < -20 {
+            format!("{:.1}", eval_cp.abs() as f32 / 100.0)
+        } else {
+            " ".to_string()
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{:<4}", lbl),
-                Style::default().bg(Color::Rgb(20,20,20)).fg(Color::Rgb(200,200,200)))
+                Style::default().bg(Color::Indexed(0)).fg(Color::Indexed(15))
+                    .add_modifier(if is_mate_row{Modifier::BOLD}else{Modifier::empty()}))
         ]));
     }
 
-    // White section (bottom)
+    // White section (bottom) — bright white background, black text
     for i in 0..white_rows as usize {
         let is_last = i == white_rows as usize - 1;
-        let lbl = if is_last && !busy {
-            let p = eval_cp as f32 / 100.0;
-            if eval_cp > 20 { format!("{:.1}", p) } else { " ".to_string() }
-        } else { " ".to_string() };
+        let is_mate_row = is_mate && is_last;
+        let lbl = if is_mate_row {
+            "MATE".to_string()
+        } else if is_last && !busy && eval_cp > 20 {
+            format!("{:.1}", eval_cp as f32 / 100.0)
+        } else {
+            " ".to_string()
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{:<4}", lbl),
-                Style::default().bg(Color::Rgb(230,230,210)).fg(Color::Rgb(30,30,30)))
+                Style::default().bg(Color::Indexed(15)).fg(Color::Indexed(0))
+                    .add_modifier(if is_mate_row{Modifier::BOLD}else{Modifier::empty()}))
         ]));
     }
 
-    // If equal or busy show a tiny indicator in the middle
-    if busy || eval_cp.abs() < 20 {
+    if !is_mate && (busy || eval_cp.abs() < 20) {
         let mid = (total / 2) as usize;
         if mid < lines.len() {
             let lbl = if busy { "~   " } else { "=   " };
             lines[mid] = Line::from(vec![
                 Span::styled(lbl, Style::default()
-                    .bg(Color::Rgb(120,120,80)).fg(Color::Rgb(240,220,40))
-                    .add_modifier(Modifier::BOLD))
+                    .bg(Color::Indexed(15)).fg(Color::Indexed(0)).add_modifier(Modifier::BOLD))
             ]);
         }
     }
@@ -1124,27 +1374,51 @@ fn draw_eval_bar(eval_cp: i32, busy: bool, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_replay_sidebar(app: &App, f: &mut Frame, area: Rect) {
-    let th = app.cfg.theme;
+fn bw_panel_block(title: &str) -> Block<'static> {
+    Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Indexed(8)))
+        .style(Style::default().bg(Color::Reset))
+        .title(Span::styled(format!(" {} ", title), Style::default().fg(Color::Indexed(15)).add_modifier(Modifier::BOLD)))
+}
+
+fn bw_label_color(label: MoveLabel) -> Color {
+    match label {
+        MoveLabel::Book       => Color::Indexed(8),
+        MoveLabel::Good       => Color::Indexed(15),
+        MoveLabel::Inaccuracy => Color::Indexed(7),
+        MoveLabel::Mistake    => Color::Indexed(8),
+        MoveLabel::Blunder    => Color::Indexed(0),
+    }
+}
+
+fn draw_analyze_sidebar(app: &App, f: &mut Frame, area: Rect) {
     let [info_area, review_area, hist_area, keys_area] = Layout::vertical([
-        Constraint::Length(5), Constraint::Length(7),
+        Constraint::Length(5), Constraint::Length(8),
         Constraint::Fill(1),   Constraint::Length(6),
     ]).areas(area);
+
+    let fg     = Color::Indexed(15);
+    let dim    = Color::Indexed(7);
+    let dimmer  = Color::Indexed(8);
+    let hilite = Color::Indexed(7);
+
+    // Available content width (minus block borders)
+    let cw = area.width.saturating_sub(2) as usize;
 
     // ── Position info ─────────────────────────────────────────────────────────
     let snap    = app.replay_snaps.get(app.replay_idx);
     let mv_info = if app.replay_idx == 0 { "  Starting position".to_string() } else {
-        let mnum = (app.replay_idx + 1) / 2;
+        let mnum = app.replay_idx.div_ceil(2);
         let who  = if app.replay_idx % 2 == 1 { "W" } else { "B" };
         let note = snap.map(|s| s.notation.as_str()).unwrap_or("");
         format!("  Move {}. [{}] {}", mnum, who, note)
     };
     let progress = format!("  {}/{}", app.replay_idx, app.replay_snaps.len().saturating_sub(1));
     f.render_widget(Paragraph::new(vec![
-        Line::from(vec![Span::styled(&mv_info, sty(CREAM).add_modifier(Modifier::BOLD))]),
-        Line::from(vec![Span::styled(&progress, sty(DIM))]),
-        Line::from(vec![Span::styled(format!("  Result: {}", app.replay_result), sty(AMBER))]),
-    ]).block(panel_block("POSITION", th)), info_area);
+        Line::from(vec![Span::styled(trunc(&mv_info, cw), sty(fg).add_modifier(Modifier::BOLD))]),
+        Line::from(vec![Span::styled(&progress, sty(dim))]),
+        Line::from(vec![Span::styled(trunc(&format!("  Result: {}", app.replay_result), cw), sty(dim))]),
+    ]).block(bw_panel_block("POSITION")), info_area);
 
     // ── Eval sparkline ────────────────────────────────────────────────────────
     let spark_width = (review_area.width.saturating_sub(4)) as usize;
@@ -1152,74 +1426,109 @@ fn draw_replay_sidebar(app: &App, f: &mut Frame, area: Rect) {
     let has_spark = !spark_str.is_empty() && app.eval_history.len() > 1;
 
     // ── Review for this move ──────────────────────────────────────────────────
-    // replay_idx 0 = start (no move), idx N = after move N-1 in history
     let review_move_idx = if app.replay_idx == 0 { None } else {
         Some(app.replay_idx - 1)
     };
     let rev = review_move_idx.and_then(|i| app.move_reviews.get(i));
-    let rev_lines: Vec<Line> = if let Some(rev) = rev {
-        let col     = label_color(rev.label, th);
+    let mut rev_lines: Vec<Line> = if let Some(rev) = rev {
+        let col     = bw_label_color(rev.label);
         let delta_p = rev.delta_cp as f32 / 100.0;
         let sign    = if delta_p > 0.0 { "+" } else { "" };
-        let ecol    = if delta_p < -1.0 { RED } else if delta_p < -0.5 { AMBER } else { GREEN };
+        let ecol    = if delta_p < -0.5 { dimmer } else if delta_p < -0.2 { dim } else { fg };
+
+        let move_time = review_move_idx
+            .and_then(|i| app.gs.history.get(i))
+            .map(|h| h.move_time_ms)
+            .unwrap_or(0);
+        let time_str = if move_time > 0 {
+            if move_time >= 60_000 {
+                format!("{:.0}m{:0>2}s", move_time as f64 / 60_000.0, (move_time / 1000) % 60)
+            } else {
+                format!("{:.1}s", move_time as f64 / 1000.0)
+            }
+        } else { String::new() };
+
+        let pv_str = rev.best_pv.as_deref().map(|pv| {
+            let rest: Vec<&str> = pv.split_whitespace().skip(1).collect();
+            if rest.is_empty() { String::new() } else { format!("PV: {}", rest.join(" ")) }
+        }).unwrap_or_default();
+
+        let top_str: String = rev.top_moves.iter().map(|(uci, cp)| {
+            let sign = if *cp >= 0 { "+" } else { "" };
+            format!("{}{}{:.2}", trunc(uci, 5), sign, *cp as f32 / 100.0)
+        }).collect::<Vec<_>>().join(" ");
+
+        let label_w = cw.saturating_sub(8);
+        let move_w  = cw.saturating_sub(8);
+        let best_w  = cw.saturating_sub(8);
+        let top_w   = cw.saturating_sub(8);
+        let pv_w    = best_w.saturating_sub(10);
+
+        let dm = |s: &str| Span::styled(s.to_string(), sty(dimmer));
         vec![
             Line::from(vec![
-                Span::styled(" Move  ", sty(DIMMER)),
-                Span::styled(trunc(&rev.san, 10), sty(CREAM).add_modifier(Modifier::BOLD)),
+                dm(" Move  "),
+                Span::styled(trunc(&rev.san, move_w), sty(fg).add_modifier(Modifier::BOLD)),
+                if !time_str.is_empty() {
+                    Span::styled(format!(" {}", time_str), sty(dim))
+                } else {
+                    Span::raw("")
+                },
             ]),
             Line::from(vec![
-                Span::styled(" Label ", sty(DIMMER)),
-                Span::styled(format!("[{}] {}", rev.label.icon(), rev.label.name()),
+                dm(" Label "),
+                Span::styled(trunc(&format!("[{}] {}", rev.label.icon(), rev.label.name()), label_w),
                     sty(col).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::styled(" Delta ", sty(DIMMER)),
-                Span::styled(format!("{}{:.2}p", sign, delta_p),
-                    sty(ecol).add_modifier(Modifier::BOLD)),
+                dm(" Eval  "),
+                Span::styled(trunc(&format!("{} -> {}", fmt_eval_f32(rev.eval_before), fmt_eval_f32(rev.eval_after)), cw), sty(dim)),
             ]),
             Line::from(vec![
-                Span::styled(" Eval  ", sty(DIMMER)),
-                Span::styled(format!("{:.2}", rev.eval_before), sty(DIM)),
-                Span::styled(" -> ", sty(DIMMER)),
-                Span::styled(format!("{:.2}", rev.eval_after), sty(ecol)),
+                dm(" Best  "),
+                Span::styled(trunc(rev.best_move.as_deref().unwrap_or("--"), best_w),
+                    sty(fg).add_modifier(Modifier::BOLD)),
+                if !pv_str.is_empty() && pv_w > 4 {
+                    Span::styled(format!("  {}", trunc(&pv_str, pv_w)), sty(dim))
+                } else {
+                    Span::raw("")
+                },
             ]),
             Line::from(vec![
-                Span::styled(" Best  ", sty(DIMMER)),
-                Span::styled(trunc(rev.best_move.as_deref().unwrap_or("--"), 10),
-                    sty(TEAL).add_modifier(Modifier::BOLD)),
+                dm(" Top:  "),
+                Span::styled(trunc(&top_str, top_w), sty(dim)),
             ]),
         ]
     } else if app.replay_idx == 0 {
         vec![
-            Line::from(vec![Span::styled(" Starting position", sty(DIMMER))]),
-            Line::from(""), Line::from(""), Line::from(""), Line::from(""),
+            Line::from(vec![Span::styled(" Starting position", sty(dimmer))]),
+            Line::from(""), Line::from(""), Line::from(""),
         ]
     } else {
         vec![
-            Line::from(vec![Span::styled(" No analysis yet", sty(DIMMER))]),
-            Line::from(vec![Span::styled(" (play game first)", sty(DIMMER))]),
-            Line::from(""), Line::from(""), Line::from(""),
+            Line::from(vec![Span::styled(" No analysis yet", sty(dimmer))]),
+            Line::from(vec![Span::styled(" (play game first)", sty(dimmer))]),
+            Line::from(""), Line::from(""),
         ]
     };
-    // Append sparkline as last line of review panel
-    let mut rev_lines_with_spark = rev_lines;
     if has_spark {
         let chars: Vec<char> = spark_str.chars().collect();
-        let mut spark_spans: Vec<Span> = vec![Span::styled(" ", sty(DIMMER))];
+        let mut spark_spans: Vec<Span> = vec![Span::styled(" ", sty(dimmer))];
         for (i, ch) in chars.iter().enumerate() {
-            let col = spark_cols.get(i).copied().unwrap_or(DIM);
+            let col = spark_cols.get(i).copied().unwrap_or(dim);
             spark_spans.push(Span::styled(ch.to_string(), sty(col)));
         }
-        rev_lines_with_spark.push(Line::from(spark_spans));
+        rev_lines.push(Line::from(spark_spans));
     }
     let busy  = if app.engine_busy { " ~" } else { " +" };
     let eng   = trunc(&app.analysis.engine_name, 12);
-    let rtitle = format!(" REVIEW{} [{}] ", busy, eng);
+    let rtitle = trunc(&format!(" REVIEW{} [{}] ", busy, eng), cw.saturating_add(2));
     f.render_widget(
-        Paragraph::new(rev_lines_with_spark).block(
+        Paragraph::new(rev_lines).block(
             Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-                .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-                .title(Span::styled(rtitle, sty(ac(th))))
+                .border_style(Style::default().fg(Color::Indexed(8)))
+                .style(Style::default().bg(Color::Reset))
+                .title(Span::styled(rtitle, Style::default().fg(Color::Indexed(15))))
         ),
         review_area,
     );
@@ -1227,7 +1536,7 @@ fn draw_replay_sidebar(app: &App, f: &mut Frame, area: Rect) {
     // ── History with current-move highlight + review labels ───────────────────
     let h   = &app.gs.history;
     let cap = hist_area.height.saturating_sub(2) as usize;
-    let mut pairs: Vec<(usize, String, String, bool, bool, Option<MoveLabel>, Option<MoveLabel>)> = vec![];
+    let mut pairs: Vec<MovePair> = vec![];
     let mut i = 0; let mut n = 1;
     while i < h.len() {
         let wc = app.replay_idx == i + 1;
@@ -1240,35 +1549,42 @@ fn draw_replay_sidebar(app: &App, f: &mut Frame, area: Rect) {
         i += 2; n += 1;
     }
     let start = pairs.len().saturating_sub(cap);
+    let cur_hl = Style::default().fg(Color::Indexed(0)).bg(hilite).add_modifier(Modifier::BOLD);
+    let hist_w = cw.saturating_sub(2).max(6); // width for move text
     let hist_lines: Vec<Line> = pairs[start..].iter().map(|(n,w,b,wc,bc,wl,bl)| {
         let w_label_str = wl.map(|l| format!(" {}", l.icon())).unwrap_or_default();
         let b_label_str = bl.map(|l| format!(" {}", l.icon())).unwrap_or_default();
-        let w_lc = wl.map(|l| label_color(l, th)).unwrap_or(DIMMER);
-        let b_lc = bl.map(|l| label_color(l, th)).unwrap_or(DIMMER);
+        let w_lc = wl.map(bw_label_color).unwrap_or(dimmer);
+        let b_lc = bl.map(bw_label_color).unwrap_or(dimmer);
+        // Collapse to fit: each pair gets hist_w/2 chars per side
+        let half = (hist_w / 2).max(4);
         Line::from(vec![
-            Span::styled(format!(" {:>3}. ", n), sty(DIMMER)),
-            Span::styled(format!("{:<8}", w),
-                if *wc { Style::default().fg(bg0(th)).bg(TEAL).add_modifier(Modifier::BOLD) } else { sty(CREAM) }),
-            Span::styled(format!("{:<3}", w_label_str), sty(w_lc)),
-            Span::styled(format!("{:<8}", b),
-                if *bc { Style::default().fg(bg0(th)).bg(TEAL).add_modifier(Modifier::BOLD) } else { sty(DIM) }),
-            Span::styled(format!("{:<3}", b_label_str), sty(b_lc)),
+            Span::styled(format!(" {:>3}. ", n), sty(dimmer)),
+            Span::styled(trunc(&format!("{:<w$}", w, w=half), half),
+                if *wc { cur_hl } else { sty(fg) }),
+            Span::styled(trunc(&w_label_str, 3), sty(w_lc)),
+            Span::styled(trunc(&format!("{:<w$}", b, w=half), half),
+                if *bc { cur_hl } else { sty(dim) }),
+            Span::styled(trunc(&b_label_str, 3), sty(b_lc)),
         ])
     }).collect();
-    f.render_widget(Paragraph::new(hist_lines).block(panel_block("HISTORY", th)), hist_area);
+    f.render_widget(Paragraph::new(hist_lines).block(bw_panel_block("HISTORY")), hist_area);
 
     // ── Keys ──────────────────────────────────────────────────────────────────
+    let k1 = trunc(" ←/h prev  →/l next  PgUp/PgDn ±10", cw);
+    let k2 = trunc(" 0 start  $ end  [ prev bad  ] next bad", cw);
+    let k4 = trunc(" Labels: + Good  ?! Inacc  ? Mist  ?? Blunder", cw);
     f.render_widget(Paragraph::new(vec![
-        Line::from(vec![Span::styled(" ←/h prev   →/l next   0 start   $ end", sty(DIM))]),
+        Line::from(vec![Span::styled(k1, sty(dim))]),
+        Line::from(vec![Span::styled(k2, sty(dim))]),
         Line::from(vec![
-            Span::styled(" E ", sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(" export PNG   ", sty(DIM)),
-            Span::styled(" q ", sty(DIM)),
-            Span::styled(" back", sty(DIM)),
+            Span::styled(" E ", sty(fg).add_modifier(Modifier::BOLD)),
+            Span::styled(" PNG  ", sty(dim)),
+            Span::styled(" q ", sty(dim)),
+            Span::styled(" back", sty(dim)),
         ]),
-        Line::from(vec![Span::styled(" Labels: + Good  ?! Inaccuracy  ? Mistake  ?? Blunder", sty(DIMMER))]),
-        Line::from(""),
-    ]).block(panel_block("REPLAY KEYS", th)), keys_area);
+        Line::from(vec![Span::styled(k4, sty(dimmer))]),
+    ]).block(bw_panel_block("ANALYZE KEYS")), keys_area);
 }
 
 // ── PROMOTION ─────────────────────────────────────────────────────────────────
@@ -1276,13 +1592,6 @@ fn draw_promo(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
     let rect = center(50, 9, f.area());
     f.render_widget(Clear, rect);
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(" PROMOTE PAWN ", sty(ac(th)).add_modifier(Modifier::BOLD))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
     let color = app.gs.turn;
     let pieces = [
         (if color==PC::White{"♕"}else{"♛"},"Queen"),
@@ -1294,164 +1603,54 @@ fn draw_promo(app: &App, f: &mut Frame) {
     for (i,(sym,name)) in pieces.iter().enumerate() {
         let s = app.promo_cur == i;
         row.push(Span::styled(format!(" {} {} ",sym,name),
-            if s{Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)}else{sty(CREAM)}));
+            if s{Style::default().fg(bg0(th)).bg(ac(th)).add_modifier(Modifier::BOLD)}else{sty(cream())}));
         row.push(Span::raw("  "));
     }
     f.render_widget(Paragraph::new(vec![
-        Line::from(vec![Span::styled(" Select promotion piece:", sty(CREAM))]),
+        Line::from(vec![Span::styled(" Select promotion piece:", sty(cream()))]),
         Line::from(""),
         Line::from(row),
         Line::from(""),
-        Line::from(vec![Span::styled(" ←→/hl select   Enter confirm   Esc cancel", sty(DIMMER))]),
-    ]), inner);
+        Line::from(vec![Span::styled(" ←→/hl select   Enter confirm   Esc cancel", sty(dimmer()))]),
+    ]).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" PROMOTE PAWN ", sty(ac(th)).add_modifier(Modifier::BOLD)))
+            .padding(Padding::new(2, 2, 1, 1)),
+    ), rect);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // -- ANALYSIS PANEL --
 
-fn label_color(label: MoveLabel, _th: Theme) -> Color {
+fn label_color(label: MoveLabel, th: Theme) -> Color {
     match label {
-        MoveLabel::Book       => TEAL,
-        MoveLabel::Good       => GREEN,
-        MoveLabel::Inaccuracy => AMBER,
-        MoveLabel::Mistake    => Color::Rgb(220, 120, 40),
-        MoveLabel::Blunder    => RED,
+        MoveLabel::Book       => info(th),
+        MoveLabel::Good       => success(th),
+        MoveLabel::Inaccuracy => warning(th),
+        MoveLabel::Mistake    => rgb(th.warning(), th),
+        MoveLabel::Blunder    => danger(th),
     }
 }
 
-fn draw_analysis_mini(app: &App, f: &mut Frame, area: Rect) {
-    let th    = app.cfg.theme;
-    let busy  = if app.engine_busy { "~" } else { "+" };
-    let eng   = trunc(&app.analysis.engine_name, 14);
-    let title = format!(" EVAL {} [{}] ", busy, eng);
-
-    let lines: Vec<Line> = if let Some(rev) = app.move_reviews.last() {
-        let col     = label_color(rev.label, th);
-        // delta_cp is mover-perspective centipawns (negative = bad move)
-        let delta_p = rev.delta_cp as f32 / 100.0;
-        let sign    = if delta_p > 0.0 { "+" } else { "" };
-        let best    = trunc(rev.best_move.as_deref().unwrap_or("--"), 8);
-        vec![
-            Line::from(vec![
-                Span::styled(format!(" [{}] ", rev.label.icon()), sty(col).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{:<11}", rev.label.name()), sty(col)),
-                Span::styled(format!("{}{:.2}p", sign, delta_p), sty(DIMMER)),
-            ]),
-            Line::from(vec![
-                Span::styled(" Best: ", sty(DIMMER)),
-                Span::styled(trunc(rev.best_move.as_deref().unwrap_or("--"), 8),
-                    sty(TEAL).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  {:.2}", rev.eval_after), sty(DIMMER)),
-            ]),
-            Line::from(""),
-        ]
-    } else if app.engine_busy {
-        vec![Line::from(vec![Span::styled(" analysing...", sty(DIMMER))]),
-             Line::from(""), Line::from("")]
-    } else {
-        vec![Line::from(vec![Span::styled(" make a move to analyse", sty(DIMMER))]),
-             Line::from(""), Line::from("")]
-    };
-
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-                .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-                .title(Span::styled(title, sty(ac(th))))
-        ),
-        area,
-    );
-}
+// (dead analysis panel functions removed — inline in draw_sidebar)
 
 
-/// Full 5-line analysis panel shown in Analysis mode.
-fn draw_analysis_full(app: &App, f: &mut Frame, area: Rect) {
-    let th    = app.cfg.theme;
-    let busy  = if app.engine_busy { "~" } else { "+" };
-    let eng   = trunc(&app.analysis.engine_name, 18);
-    let title = format!(" ANALYSIS {} [{}] ", busy, eng);
-
-    let lines: Vec<Line> = if let Some(rev) = app.move_reviews.last() {
-        let col     = label_color(rev.label, th);
-        let delta_p = rev.delta_cp as f32 / 100.0;
-        let sign    = if delta_p > 0.0 { "+" } else { "" };
-        let ecol    = if delta_p < -1.0 { RED } else if delta_p < -0.5 { AMBER } else { GREEN };
-        let san     = trunc(&rev.san, 12);
-        let mut out = vec![
-            Line::from(vec![
-                Span::styled(" Move  ", sty(DIMMER)),
-                Span::styled(san, sty(CREAM).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled(" Label ", sty(DIMMER)),
-                Span::styled(format!("[{}] {}", rev.label.icon(), rev.label.name()),
-                    sty(col).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled(" Delta ", sty(DIMMER)),
-                Span::styled(format!("{}{:.2}p", sign, delta_p),
-                    sty(ecol).add_modifier(Modifier::BOLD)),
-            ]),
-            Line::from(vec![
-                Span::styled(" Eval  ", sty(DIMMER)),
-                Span::styled(format!("{:.2}", rev.eval_before), sty(DIM)),
-                Span::styled(" -> ", sty(DIMMER)),
-                Span::styled(format!("{:.2}", rev.eval_after),
-                    sty(ecol).add_modifier(Modifier::BOLD)),
-            ]),
-        ];
-        if !rev.top_moves.is_empty() {
-            out.push(Line::from(vec![Span::styled(" Top   ", sty(DIMMER))]));
-            for (i, (mv_uci, score)) in rev.top_moves.iter().enumerate().take(3) {
-                let sp = *score as f32 / 100.0;
-                let sc = if sp > 0.0 { format!("{:+.2}", sp) } else { format!("{:.2}", sp) };
-                let mc = if i == 0 { TEAL } else { DIM };
-                out.push(Line::from(vec![
-                    Span::styled(format!("   {}. ", i+1), sty(DIMMER)),
-                    Span::styled(format!("{:<8}", trunc(mv_uci, 7)), sty(mc).add_modifier(Modifier::BOLD)),
-                    Span::styled(sc, sty(DIMMER)),
-                ]));
-            }
-        } else if let Some(ref bm) = rev.best_move {
-            out.push(Line::from(vec![
-                Span::styled(" Best  ", sty(DIMMER)),
-                Span::styled(trunc(bm, 8), sty(TEAL).add_modifier(Modifier::BOLD)),
-            ]));
-        }
-        out
-    } else {
-        let msg = if app.engine_busy { " analysing..." } else { " make a move to analyse" };
-        vec![Line::from(""), Line::from(""),
-             Line::from(vec![Span::styled(msg, sty(DIMMER))]),
-             Line::from(""), Line::from("")]
-    };
-
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-                .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-                .title(Span::styled(title, sty(ac(th))))
-        ),
-        area,
-    );
-}
-
-
-fn status_str(app: &App) -> (String, Color) {
+fn status_str(app: &App, th: Theme) -> (String, Color) {
     match app.gs.status {
         Status::Checkmate =>
-            (format!("✕ CHECKMATE — {} WINS", app.gs.turn.opp().name()), Color::Rgb(210,175,60)),
+            (format!("\u{1fa0f} CHECKMATE — {} WINNER \u{1fa09}", app.gs.turn.opp().name()), warning(th)),
         Status::Stalemate if app.game_end==GameEnd::Draw =>
-            ("½ DRAW AGREED".into(), AMBER),
+            ("\u{bd}-\u{bd} DRAW AGREED".into(), warning(th)),
         Status::Stalemate =>
-            ("½ STALEMATE — DRAW".into(), AMBER),
+            ("\u{bd}-\u{bd} STALEMATE — DRAW".into(), warning(th)),
         Status::Check =>
-            (format!("⚠ CHECK — {} TO MOVE", app.gs.turn.name()), RED),
+            (format!("\u{26a0} CHECK — {} TO MOVE", app.gs.turn.name()), danger(th)),
         _ if app.gs.clock_state==ClockState::Flagged =>
-            (format!("⏰ FLAG — {} WINS", app.gs.turn.opp().name()), RED),
-        _ if app.thinking => ("⏳ THINKING...".into(), DIM),
-        _ => (format!("► {} TO MOVE", app.gs.turn.name()), TEAL),
+            (format!("\u{1fa0f} FLAG — {} WINNER \u{1fa09}", app.gs.turn.opp().name()), danger(th)),
+        _ if app.thinking => ("\u{23f3} THINKING...".into(), dim(th)),
+        _ => (format!("\u{25b6} {} TO MOVE", app.gs.turn.name()), info(th)),
     }
 }
 
@@ -1462,9 +1661,6 @@ fn center(w: u16, h: u16, a: Rect) -> Rect {
         w.min(a.width), h.min(a.height),
     )
 }
-fn pad(r: Rect, px: u16, py: u16) -> Rect {
-    Rect::new(r.x+px, r.y+py, r.width.saturating_sub(px*2), r.height.saturating_sub(py*2))
-}
 
 
 // ── PGN SAVED OVERLAY ─────────────────────────────────────────────────────────
@@ -1472,14 +1668,6 @@ fn draw_pgn_saved(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
     let rect = center(62, 16, f.area());
     f.render_widget(Clear, rect);
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(TEAL)).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(" G  PGN SAVED ", sty(TEAL).add_modifier(Modifier::BOLD))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
-
     let path_str = app.pgn_saved_path.as_deref().unwrap_or("?");
     let home     = std::env::var("HOME").unwrap_or_default();
     let display  = if path_str.starts_with(&home) {
@@ -1492,27 +1680,32 @@ fn draw_pgn_saved(app: &App, f: &mut Frame) {
     let lines = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Saved PGN game notation to:", sty(DIM)),
+            Span::styled("  Saved PGN game notation to:", sty(dim(th))),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!("  {}", display), sty(TEAL).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {}", display), sty(info(th)).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(dimmer()))]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(format!("  {} moves  |  {}", moves, result), sty(DIM)),
+            Span::styled(format!("  {} moves  |  {}", moves, result), sty(dim(th))),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("  {:─<54}", ""), sty(dimmer()))]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Any key ", sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled("  close", sty(DIM)),
+            Span::styled("  Any key ", sty(success(th)).add_modifier(Modifier::BOLD)),
+            Span::styled("  close", sty(dim(th))),
         ]),
     ];
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(info(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" G  PGN SAVED ", sty(info(th)).add_modifier(Modifier::BOLD)))
+            .padding(Padding::new(2, 2, 1, 1)),
+    ), rect);
 }
 
 // ── MOVE TIME FORMATTER ───────────────────────────────────────────────────────
@@ -1523,150 +1716,114 @@ fn fmt_move_time(ms: u64) -> String {
 }
 
 // ── FEN INPUT SCREEN ──────────────────────────────────────────────────────────
-fn draw_fen_input(app: &App, f: &mut Frame) {
-    use ratatui::widgets::Wrap;
-    let th   = app.cfg.theme;
-    let rect = center(70, 18, f.area());
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(" \u{2261} START FROM FEN ", sty(ac(th)).add_modifier(Modifier::BOLD))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
-
-    let cursor = if (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() / 500) % 2 == 0 { "\u{2588}" } else { "" };
-
-    let (input_col, hint) = if let Some(err) = &app.fen_input_err {
-        (RED,  format!("\u{2717}  {}", err))
-    } else {
-        (CREAM, "Paste or type a FEN string and press Enter".to_string())
-    };
-
-    let example = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1";
-
-    let lines = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(" FEN:", sty(DIM))]),
-        Line::from(vec![
-            Span::styled(
-                format!(" {}{}", app.fen_input_buf, cursor),
-                sty(input_col).add_modifier(Modifier::BOLD),
-            )
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(format!(" {}", hint), sty(if app.fen_input_err.is_some() { RED } else { DIM }))]),
-        Line::from(""),
-        Line::from(vec![Span::styled(format!("  \u{2500}\u{2500}\u{2500} {:─<56}", ""), sty(DIMMER))]),
-        Line::from(""),
-        Line::from(vec![Span::styled(" Example:", sty(DIMMER))]),
-        Line::from(vec![Span::styled(format!(" {}", example), sty(DIMMER))]),
-        Line::from(""),
-        Line::from(vec![Span::styled(format!("  \u{2500}\u{2500}\u{2500} {:─<56}", ""), sty(DIMMER))]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" Enter ", sty(GREEN).add_modifier(Modifier::BOLD)),
-            Span::styled(" load position    ", sty(DIM)),
-            Span::styled(" Esc ", sty(DIM)),
-            Span::styled(" cancel", sty(DIM)),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
-// ── PGN IMPORT SCREEN ─────────────────────────────────────────────────────────
-fn draw_pgn_import(app: &App, f: &mut Frame) {
+fn draw_import(app: &App, f: &mut Frame) {
     let th   = app.cfg.theme;
     let rect = center(72, 22, f.area());
     f.render_widget(Clear, rect);
-    f.render_widget(
-        Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-            .title(Span::styled(" IMPORT PGN ", sty(ac(th)).add_modifier(Modifier::BOLD))),
-        rect,
-    );
-    let inner = pad(rect, 2, 1);
-
     let blink = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() / 500) % 2 == 0;
+        .as_millis() / 500).is_multiple_of(2);
     let cursor = if blink { "\u{2588}" } else { " " };
 
-    let char_count = app.pgn_input_buf.len();
-    let mode_hint = if app.pgn_input_buf.starts_with('/') || app.pgn_input_buf.starts_with('~') {
-        " (file path mode)"
-    } else if app.pgn_input_buf.contains('[') {
-        " (PGN text mode \u{2713})"
+    let buf = &app.import_buf;
+    let char_count = buf.len();
+
+    // Auto-detect mode based on input content
+    let is_path = buf.starts_with('/') || buf.starts_with('~');
+    let is_fen = !is_path && char_count > 0 && !buf.starts_with('[')
+        && (buf.contains('/') || buf.starts_with(|c: char| c.is_ascii_digit()));
+
+    let mode_str = if is_path {
+        "file path"
+    } else if is_fen {
+        "FEN"
+    } else if buf.starts_with('[') || char_count > 10 {
+        "PGN"
     } else if char_count > 0 {
-        " (detecting...)"
+        "detecting..."
     } else {
         ""
     };
 
-    // Show last 6 lines of what the user typed/pasted
-    let all_lines: Vec<&str> = app.pgn_input_buf.lines().collect();
+    // Show last 6 lines of input
+    let all_lines: Vec<&str> = buf.lines().collect();
     let show_from = all_lines.len().saturating_sub(6);
     let visible = &all_lines[show_from..];
+    let hidden_above = show_from;
 
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled(" Paste PGN text  ", sty(DIM)),
-            Span::styled("or", sty(DIMMER)),
-            Span::styled("  type a file path", sty(DIM)),
+            Span::styled(" Paste FEN, PGN text  ", sty(dim(th))),
+            Span::styled("or", sty(dimmer())),
+            Span::styled("  type a file path", sty(dim(th))),
         ]),
-        Line::from(vec![Span::styled(format!("  {:=<64}", ""), sty(DIMMER))]),
+        Line::from(vec![Span::styled(format!("  {:=<64}", ""), sty(dimmer()))]),
     ];
 
     if visible.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            format!(" {}", cursor), sty(TEAL))
+            format!(" {}", cursor), sty(info(th)))
         ]));
         for _ in 0..5 { lines.push(Line::from("")); }
     } else {
-        let last_i = visible.len() - 1;
+        let last_i = visible.len().saturating_sub(1);
         for (i, pline) in visible.iter().enumerate() {
             let txt = if i == last_i {
                 format!(" {}{}", pline, cursor)
             } else {
                 format!(" {}", pline)
             };
-            lines.push(Line::from(vec![Span::styled(txt, sty(CREAM))]));
+            lines.push(Line::from(vec![Span::styled(txt, sty(cream()))]));
         }
         while lines.len() < 8 { lines.push(Line::from("")); }
     }
 
-    lines.push(Line::from(vec![Span::styled(format!("  {:=<64}", ""), sty(DIMMER))]));
+    if hidden_above > 0 {
+        lines.push(Line::from(vec![Span::styled(format!("  \u{2191} {} more line{} above", hidden_above, if hidden_above==1{""}else{"s"}), sty(dimmer()))]));
+    }
 
-    if let Some(err) = &app.pgn_input_err {
-        lines.push(Line::from(vec![Span::styled(format!(" x {}", err), sty(RED))]));
+    lines.push(Line::from(vec![Span::styled(format!("  {:=<64}", ""), sty(dimmer()))]));
+
+    if let Some(err) = &app.import_err {
+        lines.push(Line::from(vec![Span::styled(format!(" x {}", err), sty(danger(th)))]));
     } else {
+        let hint = if is_fen { " FEN detected" } else { "" };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {} chars{}", char_count, mode_hint), sty(DIMMER)),
+            Span::styled(format!(" {} chars", char_count), sty(dimmer())),
+            Span::styled(hint, sty(if is_fen { success(th) } else { dim(th) })),
+            if !mode_str.is_empty() && !is_fen {
+                Span::styled(format!(" ({})", mode_str), sty(dim(th)))
+            } else {
+                Span::raw("")
+            },
         ]));
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled("  Examples:", sty(DIMMER))]));
+    lines.push(Line::from(vec![Span::styled("  Examples:", sty(dimmer()))]));
     lines.push(Line::from(vec![Span::styled(
-        "  ~/rchess_export/game.pgn       <- file path", sty(DIMMER))]));
+        "  rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 1  <- FEN", sty(dimmer()))]));
     lines.push(Line::from(vec![Span::styled(
-        "  [White \"Me\"] 1. e4 e5 2. ...  <- paste text", sty(DIMMER))]));
+        "  ~/rchess_export/game.pgn       <- file path", sty(dimmer()))]));
+    lines.push(Line::from(vec![Span::styled(
+        "  [White \"Me\"] 1. e4 e5 2. Nf3  <- PGN text", sty(dimmer()))]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled(" Enter ", sty(GREEN).add_modifier(Modifier::BOLD)),
-        Span::styled(" load    ", sty(DIM)),
-        Span::styled(" Backspace ", sty(DIM)),
-        Span::styled(" delete    ", sty(DIM)),
-        Span::styled(" Esc ", sty(DIM)),
-        Span::styled(" cancel", sty(DIM)),
+        Span::styled(" Enter ", sty(success(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(" load    ", sty(dim(th))),
+        Span::styled(" Backspace ", sty(dim(th))),
+        Span::styled(" delete    ", sty(dim(th))),
+        Span::styled(" Esc ", sty(dim(th))),
+        Span::styled(" cancel", sty(dim(th))),
     ]));
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" \u{2261} IMPORT GAME ", sty(ac(th)).add_modifier(Modifier::BOLD)))
+            .padding(Padding::new(2, 2, 1, 1)),
+    ), rect);
 }
 
 
@@ -1682,65 +1839,61 @@ fn draw_puzzle(app: &App, f: &mut Frame) {
         PuzzleState::Loading => {
             let rect = center(40, 7, a);
             f.render_widget(Clear, rect);
-            f.render_widget(
-                Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-                    .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
-                    .title(Span::styled(" \u{2605} DAILY PUZZLE ", sty(ac(th)).add_modifier(Modifier::BOLD))),
-                rect,
-            );
-            let inner = pad(rect, 2, 1);
             f.render_widget(Paragraph::new(vec![
                 Line::from(""),
-                Line::from(vec![Span::styled(" \u{23f3} Fetching from Lichess...", sty(TEAL))]),
+                Line::from(vec![Span::styled(" \u{23f3} Fetching from Lichess...", sty(info(th)))]),
                 Line::from(""),
-                Line::from(vec![Span::styled(" Esc to cancel", sty(DIMMER))]),
-            ]), inner);
+                Line::from(vec![Span::styled(" Esc to cancel", sty(dimmer()))]),
+            ]).block(
+                Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                    .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+                    .title(Span::styled(" \u{2605} DAILY PUZZLE ", sty(ac(th)).add_modifier(Modifier::BOLD)))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            ), rect);
         }
         PuzzleState::Failed(e) => {
             let has_token = !app.cfg.lichess_token.is_empty();
             let rect = center(66, 19, a);
             f.render_widget(Clear, rect);
-            f.render_widget(
-                Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
-                    .border_style(sty(RED)).style(Style::default().bg(bg1(th)))
-                    .title(Span::styled(" ★ DAILY PUZZLE — FAILED ", sty(RED).add_modifier(Modifier::BOLD))),
-                rect,
-            );
-            let inner = pad(rect, 2, 1);
             let sep = format!("  {:─<56}", "");
             let mut lines: Vec<Line> = vec![
                 Line::from(""),
-                Line::from(vec![Span::styled(format!(" Error: {}", e), sty(RED).add_modifier(Modifier::BOLD))]),
+                Line::from(vec![Span::styled(format!(" Error: {}", e), sty(danger(th)).add_modifier(Modifier::BOLD))]),
                 Line::from(""),
-                Line::from(vec![Span::styled(&sep, sty(DIMMER))]),
+                Line::from(vec![Span::styled(&sep, sty(dimmer()))]),
                 Line::from(""),
             ];
             if !has_token {
-                lines.push(Line::from(vec![Span::styled(" Lichess works without a token, but may rate-limit", sty(DIM))]));
-                lines.push(Line::from(vec![Span::styled(" anonymous requests. A free token fixes this:", sty(DIM))]));
+                lines.push(Line::from(vec![Span::styled(" Lichess works without a token, but may rate-limit", sty(dim(th)))]));
+                lines.push(Line::from(vec![Span::styled(" anonymous requests. A free token fixes this:", sty(dim(th)))]));
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![Span::styled("  1. Sign up free at lichess.org", sty(TEAL))]));
-                lines.push(Line::from(vec![Span::styled("  2. Go to lichess.org/account/security", sty(TEAL))]));
-                lines.push(Line::from(vec![Span::styled("  3. Create a Personal API Token (no scopes needed)", sty(TEAL))]));
-                lines.push(Line::from(vec![Span::styled("  4. Add to ~/.config/rchess/rchess_tui.conf:", sty(DIM))]));
-                lines.push(Line::from(vec![Span::styled("     lichess_token = lip_xxxxxxxxxxxx", sty(AMBER).add_modifier(Modifier::BOLD))]));
+                lines.push(Line::from(vec![Span::styled("  1. Sign up free at lichess.org", sty(info(th)))]));
+                lines.push(Line::from(vec![Span::styled("  2. Go to lichess.org/account/security", sty(info(th)))]));
+                lines.push(Line::from(vec![Span::styled("  3. Create a Personal API Token (no scopes needed)", sty(info(th)))]));
+                lines.push(Line::from(vec![Span::styled("  4. Add to ~/.config/rchess/rchess_tui.conf:", sty(dim(th)))]));
+                lines.push(Line::from(vec![Span::styled("     lichess_token = lip_xxxxxxxxxxxx", sty(warning(th)).add_modifier(Modifier::BOLD))]));
             } else {
-                lines.push(Line::from(vec![Span::styled(" Token is configured. Check your internet.", sty(DIM))]));
-                lines.push(Line::from(vec![Span::styled(" Also try: sudo pacman -S ca-certificates", sty(DIMMER))]));
+                lines.push(Line::from(vec![Span::styled(" Token is configured. Check your internet.", sty(dim(th)))]));
+                lines.push(Line::from(vec![Span::styled(" Also try: sudo pacman -S ca-certificates", sty(dimmer()))]));
                 lines.push(Line::from(""));
                 lines.push(Line::from(""));
                 lines.push(Line::from(""));
                 lines.push(Line::from(""));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(&sep, sty(DIMMER))]));
+            lines.push(Line::from(vec![Span::styled(&sep, sty(dimmer()))]));
             lines.push(Line::from(vec![
-                Span::styled(" n ", sty(GREEN).add_modifier(Modifier::BOLD)),
-                Span::styled(" retry    ", sty(DIM)),
-                Span::styled(" Esc ", sty(DIM)),
-                Span::styled(" back to menu", sty(DIM)),
+                Span::styled(" n ", sty(success(th)).add_modifier(Modifier::BOLD)),
+                Span::styled(" retry    ", sty(dim(th))),
+                Span::styled(" Esc ", sty(dim(th))),
+                Span::styled(" back to menu", sty(dim(th))),
             ]));
-            f.render_widget(Paragraph::new(lines), inner);
+            f.render_widget(Paragraph::new(lines).block(
+                Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+                    .border_style(sty(danger(th))).style(Style::default().bg(bg1(th)))
+                    .title(Span::styled(" ★ DAILY PUZZLE — FAILED ", sty(danger(th)).add_modifier(Modifier::BOLD)))
+                    .padding(Padding::new(2, 2, 1, 1)),
+            ), rect);
         }
         state => {
             // Puzzle is loaded — show board + info panel
@@ -1765,9 +1918,9 @@ fn draw_puzzle(app: &App, f: &mut Frame) {
                 _ => "",
             };
             let status_col = match state {
-                PuzzleState::CorrectMove | PuzzleState::Solved => GREEN,
-                PuzzleState::WrongMove(_) => RED,
-                _ => TEAL,
+                PuzzleState::CorrectMove | PuzzleState::Solved => success(th),
+                PuzzleState::WrongMove(_) => danger(th),
+                _ => info(th),
             };
 
             f.render_widget(
@@ -1805,24 +1958,24 @@ fn draw_puzzle_sidebar(app: &App, f: &mut Frame, area: Rect) {
             .cloned().collect::<Vec<_>>().join("\n  ");
         vec![
             Line::from(vec![
-                Span::styled(" Puzzle  ", sty(DIMMER)),
-                Span::styled(format!("#{}", p.id), sty(CREAM).add_modifier(Modifier::BOLD)),
+                Span::styled(" Puzzle  ", sty(dimmer())),
+                Span::styled(format!("#{}", p.id), sty(cream()).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::styled(" Rating  ", sty(DIMMER)),
-                Span::styled(format!("{}", p.rating), sty(AMBER).add_modifier(Modifier::BOLD)),
+                Span::styled(" Rating  ", sty(dimmer())),
+                Span::styled(format!("{}", p.rating), sty(warning(th)).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::styled(" You are ", sty(DIMMER)),
+                Span::styled(" You are ", sty(dimmer())),
                 Span::styled(you_are, sty(if app.gs.turn == crate::engine::Color::White { pw(th) } else { pb_c(th) }).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
                 Span::styled(if solved { " \u{2605} SOLVED!" } else if wrong { " \u{2717} Wrong" } else { " Find best move" },
-                    sty(if solved { GREEN } else if wrong { RED } else { TEAL }).add_modifier(Modifier::BOLD))
+                    sty(if solved { success(th) } else if wrong { danger(th) } else { info(th) }).add_modifier(Modifier::BOLD))
             ]),
             Line::from(""),
-            Line::from(vec![Span::styled(" Themes:", sty(DIMMER))]),
-            Line::from(vec![Span::styled(format!("  {}", themes), sty(DIM))]),
+            Line::from(vec![Span::styled(" Themes:", sty(dimmer()))]),
+            Line::from(vec![Span::styled(format!("  {}", themes), sty(dim(th)))]),
         ]
     } else {
         vec![Line::from("")]
@@ -1833,14 +1986,14 @@ fn draw_puzzle_sidebar(app: &App, f: &mut Frame, area: Rect) {
     let cur_bc   = app.to_board(app.cursor);
     let cur_name = format!("{}{}", (b'a' + cur_bc.1 as u8) as char, 8 - cur_bc.0);
     let (input_line, input_col) = if !app.input_buf.is_empty() {
-        (format!("  [{}]  {}\u{2588}", cur_name, app.input_buf), CREAM)
+        (format!("  [{}]  {}\u{2588}", cur_name, app.input_buf), cream())
     } else {
-        (format!("  [{}]  type move or click", cur_name), DIM)
+        (format!("  [{}]  type move or click", cur_name), dim(th))
     };
     let hint = if let Some(err) = &app.input_err {
-        (format!("  \u{2717}  {}", err), RED)
+        (format!("  \u{2717}  {}", err), danger(th))
     } else {
-        ("  e.g. Nf3  or  navigate + Enter".to_string(), DIMMER)
+        ("  e.g. Nf3  or  navigate + Enter".to_string(), dimmer())
     };
     f.render_widget(Paragraph::new(vec![
         Line::from(vec![Span::styled(input_line, sty(input_col).add_modifier(Modifier::BOLD))]),
@@ -1849,8 +2002,191 @@ fn draw_puzzle_sidebar(app: &App, f: &mut Frame, area: Rect) {
 
     // Keys
     f.render_widget(Paragraph::new(vec![
-        Line::from(vec![Span::styled(" \u{2191}\u{2193}\u{2190}\u{2192}/hjkl  move cursor", sty(DIM))]),
-        Line::from(vec![Span::styled(" Enter/click  select & move", sty(DIM))]),
-        Line::from(vec![Span::styled(" n  new puzzle    q  menu", sty(DIM))]),
+        Line::from(vec![Span::styled(" \u{2191}\u{2193}\u{2190}\u{2192}/hjkl  move cursor", sty(dim(th)))]),
+        Line::from(vec![Span::styled(" Enter/click  select & move", sty(dim(th)))]),
+        Line::from(vec![Span::styled(" n  new puzzle    q  menu", sty(dim(th)))]),
     ]).block(panel_block("KEYS", th)), keys_area);
+}
+
+// ── ONLINE ──────────────────────────────────────────────────────────────────
+fn draw_load_game(app: &App, f: &mut Frame) {
+    let th = app.cfg.theme;
+    let rect = center(72, 28, f.area());
+    let mut lines: Vec<Line> = vec![];
+
+    if app.saved_games.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  No saved games found.", sty(dim(th)))]));
+    } else {
+        for (i, (_, save)) in app.saved_games.iter().enumerate() {
+            let s = app.menu_cur == i;
+            let status_tag = if save.incomplete { " ⟳" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(if s {" ▶ "} else {"   "}, sty(ac(th))),
+                Span::styled(
+                    format!("{} vs {}  [{}]  {}{}", save.white_name, save.black_name, save.time_control, save.result, status_tag),
+                    if s { sty(cream()).add_modifier(Modifier::BOLD) } else { sty(dim(th)) },
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("      "),
+                Span::styled(format!("{} moves — {}",
+                    save.moves.len(), &save.date[..19]), sty(dimmer())),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(format!("  {:─<60}", ""), sty(dimmer()))]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Enter ", sty(success(th)).add_modifier(Modifier::BOLD)),
+        Span::styled(" load and analyze    ", sty(dim(th))),
+        Span::styled(" Esc ", sty(dim(th))),
+        Span::styled(" back to menu", sty(dim(th))),
+    ]));
+
+    f.render_widget(Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" ⇪ SAVED GAMES ", sty(ac(th)).add_modifier(Modifier::BOLD)))
+            .padding(Padding::new(2, 2, 1, 1)),
+    ), rect);
+}
+
+fn draw_online_lobby(app: &App, f: &mut Frame) {
+    let th = app.cfg.theme;
+    let has_token = !app.cfg.lichess_token.is_empty();
+    let connected = app.lichess.is_some();
+    let mut lines = vec![
+        Line::from(vec![Span::styled("  ONLINE PLAY", sty(ac(th)).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Account: ", sty(ac(th))),
+            Span::styled(if connected { &app.player_name } else { "—" }, sty(if connected { success(th) } else { dim(th) })),
+        ]),
+        Line::from(vec![Span::styled(format!("  Status: {}", app.online_status), sty(if connected { success(th) } else { dim(th) }))]),
+        Line::from(""),
+    ];
+    if !has_token {
+        lines.push(Line::from(vec![Span::styled("  Set lichess_token in Settings", sty(danger(th)))]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  s  Settings", sty(dim(th)))]));
+    } else if connected {
+        let tcs = ["10+0", "5+5", "15+10", "30+0"];
+        let tc_label = tcs[app.online_tc_idx.min(tcs.len() - 1)];
+        let rated_label = if app.online_rated { "Rated" } else { "Casual" };
+
+        // Match settings
+        lines.push(Line::from(vec![Span::styled("  MATCH SETTINGS:", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+        lines.push(Line::from(vec![
+            Span::styled(format!("   {}  {}", rated_label, tc_label), sty(cream())),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("   r  toggle rated    t  cycle time", sty(dim(th))),
+        ]));
+        lines.push(Line::from(""));
+
+        // Play random
+        if app.online_seeking {
+            lines.push(Line::from(vec![Span::styled("  Seeking opponent... (Esc to cancel)", sty(warning(th)))]));
+        } else {
+            lines.push(Line::from(vec![Span::styled("  p  Play random", sty(success(th)).add_modifier(Modifier::BOLD))]));
+        }
+        lines.push(Line::from(""));
+
+        // Show available challenges
+        if app.lichess_challenges.is_empty() {
+            lines.push(Line::from(vec![Span::styled("  No incoming challenges", sty(dim(th)))]));
+        } else {
+            lines.push(Line::from(vec![Span::styled("  CHALLENGES:", sty(ac(th)).add_modifier(Modifier::BOLD))]));
+            for ch in &app.lichess_challenges {
+                let rating = ch.challenger_rating.map(|r| r.to_string()).unwrap_or_else(|| "?".into());
+                let tc = &ch.time_control;
+                lines.push(Line::from(vec![
+                    Span::styled(format!("   {} ({}", ch.challenger_name, rating), sty(ac(th))),
+                    Span::styled(format!(", {tc}, {})", ch.variant), sty(dim(th))),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled("  a  accept    d  decline", sty(dim(th)))]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  c  Challenge user", sty(ac(th)))]));
+        if app.challenge_mode {
+            let blink = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() / 500).is_multiple_of(2);
+            let cursor = if blink { "\u{2588}" } else { " " };
+            let display = if app.challenge_buf.is_empty() { format!("{cursor}_") } else { format!("{}{}", app.challenge_buf, cursor) };
+            lines.push(Line::from(vec![Span::styled(format!("     Enter username: [{display}]"), sty(ac(th)))]));
+            lines.push(Line::from(vec![Span::styled("     Enter to send    Esc to cancel", sty(dim(th)))]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  q  Main menu    s  Settings", sty(dim(th)))]));
+    } else {
+        lines.push(Line::from(vec![Span::styled("  Connecting...", sty(dim(th)))]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled("  q  Main menu", sty(dim(th)))]));
+    }
+
+    let h = lines.len() as u16 + 4;
+    let rect = center(56, h.min(28), f.area());
+    f.render_widget(Paragraph::new(lines).block(
+        Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+            .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+            .title(Span::styled(" LOBBY ", sty(ac(th))))
+            .padding(Padding::new(2, 2, 1, 1)),
+    ), rect);
+}
+
+fn draw_online_game(app: &App, f: &mut Frame) {
+    draw_game(app, f);
+    let th = app.cfg.theme;
+    let rect = f.area();
+    if let Some(ref opp) = app.lichess_opponent {
+        let rating = app.lichess_opponent_rating.map(|r| format!(" ({r})")).unwrap_or_default();
+        let top = Rect::new(rect.x + 2, rect.y + 1, rect.width.saturating_sub(4), 1);
+        f.render_widget(Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(" \u{2654} ", sty(ac(th))),
+                Span::styled(format!("{opp}{rating}"), sty(ac(th))),
+            ])
+        ]).block(Block::default().style(Style::default().bg(bg0(th)))), top);
+    }
+    // Chat panel (bottom-right, above status bar)
+    if !app.chat_messages.is_empty() || app.online_chat_mode || !app.chat_buf.is_empty() {
+        let panel_w = 36u16.min(rect.width.saturating_sub(4));
+        let max_vis = 6usize;
+        let chat_h = (app.chat_messages.len().min(max_vis) + if app.online_chat_mode { 2 } else { 1 }) as u16;
+        let chat_rect = Rect::new(
+            rect.x + rect.width.saturating_sub(panel_w + 2),
+            rect.y + rect.height.saturating_sub(chat_h + 6),
+            panel_w, chat_h + 2,
+        );
+        let mut chat_lines: Vec<Line> = app.chat_messages.iter()
+            .rev().take(max_vis).rev()
+            .map(|m| Line::from(vec![Span::styled(trunc(m, (panel_w - 4) as usize), sty(dim(th)))]))
+            .collect();
+        if app.online_chat_mode {
+            let prompt = format!(" > {}", app.chat_buf);
+            chat_lines.push(Line::from(vec![Span::styled(trunc(&prompt, (panel_w - 4) as usize), sty(ac(th)))]));
+            chat_lines.push(Line::from(vec![Span::styled(" Esc cancel  Enter send", sty(dimmer()))]));
+        }
+        f.render_widget(Clear, chat_rect);
+        f.render_widget(Paragraph::new(chat_lines).block(
+            Block::default().borders(Borders::ALL).border_type(BorderType::Plain)
+                .border_style(sty(ac(th))).style(Style::default().bg(bg1(th)))
+                .title(Span::styled(" CHAT ", sty(ac(th))))
+                .padding(Padding::new(1, 1, 0, 0)),
+        ), chat_rect);
+    }
+    // Status bar
+    let status_rect = Rect::new(rect.x + 2, rect.y + rect.height.saturating_sub(4), rect.width.saturating_sub(4), 3);
+    let mut lines = vec![
+        Line::from(vec![Span::styled(format!(" {}", app.online_status), sty(dim(th)))]),
+        Line::from(vec![Span::styled(" Esc/q back to lobby  a=abort  x=resign  t=takeback  v=claim  c=chat  s=settings", sty(dim(th)))]),
+    ];
+    f.render_widget(Paragraph::new(lines).style(sty(dim(th))), status_rect);
 }

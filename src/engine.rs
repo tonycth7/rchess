@@ -1,5 +1,6 @@
 // src/engine.rs
-#[derive(Clone,Copy,PartialEq,Eq,Debug)]
+use serde::{Serialize, Deserialize};
+#[derive(Clone,Copy,PartialEq,Eq,Debug,Serialize,Deserialize)]
 pub enum Color{White,Black}
 impl Color{
     pub fn opp(self)->Self{match self{Color::White=>Color::Black,Color::Black=>Color::White}}
@@ -43,10 +44,11 @@ pub fn start_board()->Board{
     for(c,&k) in back.iter().enumerate(){
         b[0][c]=Some(Piece{c:Color::Black,k});b[7][c]=Some(Piece{c:Color::White,k});
     }
-    for c in 0..8{b[1][c]=Some(Piece{c:Color::Black,k:Kind::P});b[6][c]=Some(Piece{c:Color::White,k:Kind::P});}
+    for sq in &mut b[1]{*sq=Some(Piece{c:Color::Black,k:Kind::P});}
+    for sq in &mut b[6]{*sq=Some(Piece{c:Color::White,k:Kind::P});}
     b
 }
-fn ib(r:i32,c:i32)->bool{r>=0&&r<8&&c>=0&&c<8}
+fn ib(r:i32,c:i32)->bool{(0..8).contains(&r)&&(0..8).contains(&c)}
 fn slide(b:&Board,r:usize,c:usize,col:Color,dirs:&[(i32,i32)],out:&mut Vec<Mv>){
     for&(dr,dc) in dirs{
         let(mut nr,mut nc)=(r as i32+dr,c as i32+dc);
@@ -136,13 +138,17 @@ pub fn attacked(b:&Board,r:usize,c:usize,by:Color)->bool{
     false
 }
 pub fn king_sq(b:&Board,c:Color)->Option<(usize,usize)>{
-    for r in 0..8{for cc in 0..8{if let Some(p)=b[r][cc]{if p.c==c&&p.k==Kind::K{return Some((r,cc));}}}}
+    for (r,row) in b.iter().enumerate(){
+        for (cc,cell) in row.iter().enumerate(){
+            if let Some(p)=*cell{if p.c==c&&p.k==Kind::K{return Some((r,cc));}}
+        }
+    }
     None
 }
 pub fn in_check(b:&Board,c:Color)->bool{king_sq(b,c).map(|(r,cc)|attacked(b,r,cc,c.opp())).unwrap_or(false)}
 pub fn apply(b:&Board,mv:&Mv,_ep:Option<(usize,usize)>,cast:&Castle)->(Board,Option<(usize,usize)>,Castle){
     let mut nb=*b;let mut nc=*cast;
-    let p=nb[mv.fr.0][mv.fr.1].unwrap();
+    let Some(p)=nb[mv.fr.0][mv.fr.1] else { return (*b, None, *cast); };
     let mut new_ep=None;
     if mv.ep{let cap_r=if p.c==Color::White{mv.to.0+1}else{mv.to.0.wrapping_sub(1)};nb[cap_r][mv.to.1]=None;}
     if p.k==Kind::P&&(mv.to.0 as i32-mv.fr.0 as i32).abs()==2{new_ep=Some(((mv.fr.0+mv.to.0)/2,mv.fr.1));}
@@ -167,7 +173,7 @@ pub fn legal(b:&Board,color:Color,ep:Option<(usize,usize)>,cast:&Castle)->Vec<Mv
     out
 }
 #[derive(Clone,Copy,PartialEq,Eq,Debug)]
-pub enum Status{Active,Check,Checkmate,Stalemate}
+pub enum Status{Active,Check,Checkmate,Stalemate,Draw}
 pub fn game_status(b:&Board,color:Color,ep:Option<(usize,usize)>,cast:&Castle)->Status{
     let moves=legal(b,color,ep,cast);let chk=in_check(b,color);
     match(moves.is_empty(),chk){(true,true)=>Status::Checkmate,(true,false)=>Status::Stalemate,(false,true)=>Status::Check,_=>Status::Active}
@@ -265,16 +271,18 @@ fn init_zobrist() -> ZobristTable {
 pub fn zobrist_hash(b: &Board, stm: Color, ep: Option<(usize,usize)>, cast: &Castle) -> u64 {
     let z = ZOBRIST.get_or_init(init_zobrist);
     let mut h = 0u64;
-    for r in 0..8 {
-        for c in 0..8 {
-            if let Some(p) = b[r][c] {
+    for (r, row) in b.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if let Some(p) = *cell {
                 h ^= z.pieces[piece_index(p.c, p.k)][r * 8 + c];
             }
         }
     }
     if stm == Color::Black { h ^= z.side; }
     if let Some((_, cf)) = ep { h ^= z.ep[cf]; }
-    if cast.wk { h ^= z.castle[0]; } if cast.wq { h ^= z.castle[1]; }
-    if cast.bk { h ^= z.castle[2]; } if cast.bq { h ^= z.castle[3]; }
+    if cast.wk { h ^= z.castle[0]; }
+    if cast.wq { h ^= z.castle[1]; }
+    if cast.bk { h ^= z.castle[2]; }
+    if cast.bq { h ^= z.castle[3]; }
     h
 }

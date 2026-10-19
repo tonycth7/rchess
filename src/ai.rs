@@ -50,9 +50,9 @@ impl SearchCtx {
 // ── Improved evaluation ───────────────────────────────────────────────────────
 pub fn evaluate(b: &Board) -> i32 {
     let mut mg = 0i32; let mut eg = 0i32; let mut phase = 0i32;
-    for r in 0..8 {
-        for c in 0..8 {
-            if let Some(p) = b[r][c] {
+    for (r, row) in b.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if let Some(p) = *cell {
                 let pr = if p.c == Color::White { r } else { 7 - r };
                 let pc = pv(p.k);
                 if p.c == Color::White { mg += pc + pst_mg(p.k,pr,c); eg += pc + pst_eg(p.k,pr,c); }
@@ -76,8 +76,8 @@ pub fn evaluate(b: &Board) -> i32 {
 fn pawn_analysis(b: &Board, color: Color) -> (i32,i32,i32) {
     let mut files = [0i32;8]; let mut hi = [0i32;8];
     let opp = color.opp();
-    for r in 0..8 { for c in 0..8 {
-        if let Some(p) = b[r][c] {
+    for (r, row) in b.iter().enumerate() { for c in 0..8 {
+        if let Some(p) = row[c] {
             if p.c == color && p.k == Kind::P {
                 files[c] += 1; let pr = if color == Color::White { r as i32 } else { 7 - r as i32 };
                 if pr > hi[c] { hi[c] = pr; }
@@ -91,14 +91,14 @@ fn pawn_analysis(b: &Board, color: Color) -> (i32,i32,i32) {
         if files[c] > 0 && !l && !r { iso += files[c]; }
     }
     passed = 0;
-    for r in 0..8 { for c in 0..8 {
-        if let Some(p) = b[r][c] {
+    for (r, row) in b.iter().enumerate() { for c in 0..8 {
+        if let Some(p) = row[c] {
             if p.c == color && p.k == Kind::P {
                 let mut is_passed = true;
                 let (min_r,max_r) = if color == Color::White { (0, r) } else { (r+1, 7) };
-                for rr in min_r..=max_r {
-                    for cc in c.saturating_sub(1)..=7.min(c+1) {
-                        if let Some(ep) = b[rr][cc] { if ep.c == opp && ep.k == Kind::P { is_passed = false; } }
+                for rank in &b[min_r..=max_r] {
+                    for cell in &rank[c.saturating_sub(1)..=7.min(c+1)] {
+                        if let Some(ep) = *cell { if ep.c == opp && ep.k == Kind::P { is_passed = false; } }
                     }
                 }
                 if is_passed { passed += 1; }
@@ -115,10 +115,10 @@ fn king_safety(b: &Board, color: Color) -> i32 {
     // Pawn shield (two ranks in front)
     for rank in 1..=2 {
         let fr = ksq.0 as i32 + dir * rank;
-        if fr >= 0 && fr < 8 {
+        if (0..8).contains(&fr) {
             for dc in -1..=1 {
                 let fc = ksq.1 as i32 + dc;
-                if fc >= 0 && fc < 8 {
+                if (0..8).contains(&fc) {
                     match b[fr as usize][fc as usize] { Some(p) if p.c == color && p.k == Kind::P => sc += (14 - rank * 4), _ => {} }
                 }
             }
@@ -127,9 +127,9 @@ fn king_safety(b: &Board, color: Color) -> i32 {
     // Open files near king penalty
     for dc in -2i32..=2 {
         let fc = ksq.1 as i32 + dc;
-        if fc >= 0 && fc < 8 {
+        if (0..8).contains(&fc) {
             let mut has_pawn = false;
-            for r in 0..8 { if let Some(p) = b[r][fc as usize] { if p.c == color && p.k == Kind::P { has_pawn = true; break; } } }
+            for row in b { if let Some(p) = row[fc as usize] { if p.c == color && p.k == Kind::P { has_pawn = true; break; } } }
             if !has_pawn { sc -= 8i32.saturating_sub(dc.abs() * 2).max(2); }
         }
     }
@@ -152,21 +152,24 @@ fn order_moves(b: &Board, moves: &[Mv], color: Color, ply: usize, tt_move: Optio
         if tt_move == Some(*mv) { s += 10_000_000; }
         if mv.ep { s += 1_000_000 + 100; }
         else if let Some(t) = b[mv.to.0][mv.to.1] {
-            let a = b[mv.fr.0][mv.fr.1].unwrap();
-            s += pv(t.k) * 10 - pv(a.k) + 1_000_000;
+            if let Some(a) = b[mv.fr.0][mv.fr.1] {
+                s += pv(t.k) * 10 - pv(a.k) + 1_000_000;
+            }
         }
         let k = ctx.killers[ply.clamp(0,63)];
         if k[0] == Some(*mv) { s += 500_000; } else if k[1] == Some(*mv) { s += 250_000; }
-        let pi = piece_index(color, b[mv.fr.0][mv.fr.1].unwrap().k);
-        s += ctx.history[pi][mv.to.0 * 8 + mv.to.1];
+        if let Some(block) = b[mv.fr.0][mv.fr.1] {
+            let pi = piece_index(color, block.k);
+            s += ctx.history[pi][mv.to.0 * 8 + mv.to.1];
+        }
         (*mv, s)
     }).collect();
-    sc.sort_by(|a,b| b.1.cmp(&a.1));
+    sc.sort_by_key(|m| std::cmp::Reverse(m.1));
     sc
 }
 
 // ── Quiescence search ─────────────────────────────────────────────────────────
-fn quiesce(b: &Board, mut alpha: i32, mut beta: i32, is_max: bool, ep: Option<(usize,usize)>, cast: &Castle, ctx: &mut SearchCtx) -> i32 {
+fn quiesce(b: &Board, mut alpha: i32, mut beta: i32, is_max: bool, ep: Option<(usize,usize)>, cast: &Castle, _ctx: &mut SearchCtx) -> i32 {
     let sp = evaluate(b);
     if is_max {
         if sp >= beta { return beta; }
@@ -180,14 +183,14 @@ fn quiesce(b: &Board, mut alpha: i32, mut beta: i32, is_max: bool, ep: Option<(u
     let mut caps: Vec<(&Mv, i32)> = moves.iter().filter(|mv| mv.ep || b[mv.to.0][mv.to.1].is_some() || mv.promo.is_some())
         .map(|mv| {
             let s = if mv.ep { 100 } else if let Some(t) = b[mv.to.0][mv.to.1] {
-                let a = b[mv.fr.0][mv.fr.1].unwrap(); pv(t.k) * 10 - pv(a.k)
+                b[mv.fr.0][mv.fr.1].map_or(0, |a| pv(t.k) * 10 - pv(a.k))
             } else { 0 };
             (mv, s)
         }).collect();
-    caps.sort_by(|a,b| b.1.cmp(&a.1));
+    caps.sort_by_key(|m| std::cmp::Reverse(m.1));
     for (mv,_) in caps {
         let (nb,ne,nc) = apply(b, mv, ep, cast);
-        let sc = quiesce(&nb, alpha, beta, !is_max, ne, &nc, ctx);
+        let sc = quiesce(&nb, alpha, beta, !is_max, ne, &nc, _ctx);
         if is_max {
             if sc > alpha { alpha = sc; }
             if alpha >= beta { return beta; }
@@ -200,6 +203,9 @@ fn quiesce(b: &Board, mut alpha: i32, mut beta: i32, is_max: bool, ep: Option<(u
 }
 
 // ── Alpha-beta with TT, killers, history ──────────────────────────────────────
+// Ten parameters is deliberate: this is the hot recursive search path, and
+// threading them through a struct adds indirection without improving clarity.
+#[allow(clippy::too_many_arguments)]
 fn alpha_beta(b: &Board, depth: u8, mut alpha: i32, mut beta: i32, is_max: bool, ep: Option<(usize,usize)>, cast: &Castle, ply: u8, ctx: &mut SearchCtx, lock: &mut TranspositionTable) -> i32 {
     let hash = zobrist_hash(b, if is_max { Color::White } else { Color::Black }, ep, cast);
     if let Some((fl,td,ts,bm)) = lock.probe(hash) {
@@ -239,8 +245,10 @@ fn alpha_beta(b: &Board, depth: u8, mut alpha: i32, mut beta: i32, is_max: bool,
                 let k = ctx.killers[p][0];
                 ctx.killers[p][1] = k; ctx.killers[p][0] = Some(*mv);
                 // History update
-                let pi = piece_index(color, b[mv.fr.0][mv.fr.1].unwrap().k);
-                ctx.history[pi][mv.to.0 * 8 + mv.to.1] += (depth as i32) * (depth as i32);
+                if let Some(block) = b[mv.fr.0][mv.fr.1] {
+                    let pi = piece_index(color, block.k);
+                    ctx.history[pi][mv.to.0 * 8 + mv.to.1] += (depth as i32) * (depth as i32);
+                }
             }
             break;
         }
@@ -283,10 +291,10 @@ pub fn best_mv(b: &Board, color: Color, ep: Option<(usize,usize)>, cast: &Castle
     let moves = legal(b, color, ep, cast);
     if moves.is_empty() { return None; }
     let mut ctx = SearchCtx::new();
-    let mut lock = tt().lock().unwrap();
+    let mut lock = tt().lock().unwrap_or_else(|e| e.into_inner());
     lock.clear();
     drop(lock); // Don't hold lock during search — re-acquire per call
-    let mut lock = tt().lock().unwrap();
+    let mut lock = tt().lock().unwrap_or_else(|e| e.into_inner());
     let (_, mv) = search_root(b, color, ep, cast, depth, &mut ctx, &mut lock);
     mv
 }
@@ -295,7 +303,7 @@ pub fn best_mv_with_score(b: &Board, color: Color, ep: Option<(usize,usize)>, ca
     let moves = legal(b, color, ep, cast);
     if moves.is_empty() { return (None, evaluate(b)); }
     let mut ctx = SearchCtx::new();
-    let mut lock = tt().lock().unwrap();
+    let mut lock = tt().lock().unwrap_or_else(|e| e.into_inner());
     lock.clear();
     let (sc, mv) = search_root(b, color, ep, cast, depth, &mut ctx, &mut lock);
     (mv, sc)
@@ -305,7 +313,7 @@ pub fn top_n_moves(b: &Board, color: Color, ep: Option<(usize,usize)>, cast: &Ca
     let moves = legal(b, color, ep, cast);
     if moves.is_empty() { return vec![]; }
     let mut ctx = SearchCtx::new();
-    let mut lock = tt().lock().unwrap();
+    let mut lock = tt().lock().unwrap_or_else(|e| e.into_inner());
     lock.clear();
     let is_max = color == Color::White;
     let mut scored: Vec<(Mv,i32)> = moves.iter().map(|mv| {
@@ -313,7 +321,7 @@ pub fn top_n_moves(b: &Board, color: Color, ep: Option<(usize,usize)>, cast: &Ca
         let sc = alpha_beta(&nb, depth, i32::MIN+1, i32::MAX-1, !is_max, ne, &nc, 1, &mut ctx, &mut lock);
         (*mv, sc)
     }).collect();
-    if is_max { scored.sort_by(|a,b| b.1.cmp(&a.1)); } else { scored.sort_by(|a,b| a.1.cmp(&b.1)); }
+    if is_max { scored.sort_by_key(|m| std::cmp::Reverse(m.1)); } else { scored.sort_by_key(|a| a.1); }
     scored.truncate(n);
     scored
 }

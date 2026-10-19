@@ -5,126 +5,124 @@ use std::path::PathBuf;
 // ── Theme ─────────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Theme {
-    Classic, Tournament, Mocha, Slate, Midnight, Crimson, MatteBlack, Ocean,
+    Classic, Tournament, Slate, MatteBlack, Mocha,
 }
 impl Theme {
     pub const ALL: &'static [Theme] = &[
-        Theme::Classic, Theme::Tournament, Theme::Mocha,
-        Theme::Slate,   Theme::Midnight,   Theme::Crimson, Theme::MatteBlack, Theme::Ocean,
+        Theme::Classic, Theme::Tournament, Theme::Slate, Theme::MatteBlack, Theme::Mocha,
     ];
     pub fn name(self) -> &'static str {
         match self {
-            Theme::Classic     => "Classic      (cream/brown)",
-            Theme::Tournament  => "Tournament   (green/gold)",
-            Theme::Mocha       => "Mocha        (brown/cream)",
-            Theme::Slate       => "Slate        (grey/cyan)",
-            Theme::Midnight    => "Midnight     (navy/purple)",
-            Theme::Crimson     => "Crimson      (red/white)",
-            Theme::MatteBlack  => "Matte Black  (dark grey/gold)",
-            Theme::Ocean       => "Ocean        (navy/cyan)",
+            Theme::Classic    => "Classic     (cream/brown)",
+            Theme::Tournament => "Tournament  (green/gold)",
+            Theme::Slate      => "Slate       (grey/cyan)",
+            Theme::MatteBlack => "Matte Black (dark grey/gold)",
+            Theme::Mocha      => "Mocha       (Catppuccin Mocha)",
         }
     }
     pub fn squares(self) -> ((u8,u8,u8),(u8,u8,u8)) {
         match self {
             Theme::Classic    => ((240,217,181),(181,136, 99)),
             Theme::Tournament => ((100,140,100),( 50, 80, 50)),
-            Theme::Mocha      => ((180,140,100),(110, 80, 50)),
             Theme::Slate      => (( 90,110,130),( 50, 65, 80)),
-            Theme::Midnight   => (( 60, 60,120),( 30, 30, 70)),
-            Theme::Crimson    => ((160, 60, 60),( 90, 30, 30)),
             Theme::MatteBlack => (( 55, 55, 55),( 22, 22, 22)),
-            Theme::Ocean      => (( 40, 70,110),( 15, 35, 65)),
+            Theme::Mocha      => (( 69, 71, 90),( 49, 50, 68)),
         }
     }
     pub fn accent(self) -> (u8,u8,u8) {
         match self {
             Theme::Classic    => (160,110, 60),
             Theme::Tournament => (210,175, 60),
-            Theme::Mocha      => (200,160, 90),
             Theme::Slate      => ( 80,200,200),
-            Theme::Midnight   => (160,100,220),
-            Theme::Crimson    => (240,200,200),
             Theme::MatteBlack => (200,160, 30),
-            Theme::Ocean      => ( 40,220,220),
+            Theme::Mocha      => (203,166,247),
         }
     }
     pub fn select(self) -> (u8,u8,u8) {
         match self {
             Theme::Classic    => (205,210, 60),
             Theme::Tournament => (180,160, 40),
-            Theme::Mocha      => (200,170, 80),
             Theme::Slate      => ( 60,180,180),
-            Theme::Midnight   => (120, 80,200),
-            Theme::Crimson    => (220, 80, 80),
             Theme::MatteBlack => (180,140, 20),
-            Theme::Ocean      => ( 20,180,200),
+            Theme::Mocha      => (250,179,135),
         }
     }
     pub fn cursor(self) -> (u8,u8,u8) {
         match self {
             Theme::MatteBlack => (220,180, 30),
-            Theme::Ocean      => ( 50,230,230),
+            Theme::Mocha      => (137,220,235),
             _              => (200,180, 50),
         }
     }
     pub fn last_move(self) -> (u8,u8,u8) {
         match self {
             Theme::MatteBlack => (160,130, 20),
-            Theme::Ocean      => ( 30,160,180),
-            _ => (160,140, 30),
-            _              => self.accent(),
+            Theme::Mocha      => (180,190,254),
+            _              => (160,140, 30),
         }
     }
     pub fn piece_colors(self) -> ((u8,u8,u8),(u8,u8,u8)) {
         match self {
-            Theme::MatteBlack => ((240,230,200),(190,190,195)),  // warm ivory / bright silver
-            Theme::Ocean      => ((240,250,255),( 20, 60,120)),
-            Theme::Classic => ((255,248,220),(15,10,5)),  // warm cream white / near-black
-            _ => ((240,240,240),(15,15,15)),
-            _              => ((240,235,210),(28,18, 8)),
+            Theme::MatteBlack => ((240,230,200),(180,170,160)),
+            Theme::Classic    => ((255,248,220),(80,60,40)),
+            Theme::Tournament => ((240,240,240),(50,55,50)),
+            Theme::Slate      => ((230,230,240),(100,140,160)),
+            Theme::Mocha      => ((205,214,244),(127,132,156)),
         }
     }
     pub fn bg_colors(self) -> ((u8,u8,u8),(u8,u8,u8)) {
         match self {
             Theme::Classic    => ((36, 22, 12),(52, 34, 18)),
             Theme::Tournament => ((14, 20, 14),(22, 30, 22)),
-            Theme::Mocha      => ((30, 18,  8),(44, 28, 14)),
             Theme::Slate      => ((16, 20, 28),(22, 28, 40)),
-            Theme::Midnight   => (( 8,  8, 20),(14, 14, 32)),
-            Theme::Crimson    => ((28,  8,  8),(42, 14, 14)),
             Theme::MatteBlack => (( 8,  8,  8),(16, 16, 16)),
-            Theme::Ocean      => (( 5, 15, 35),(10, 22, 50)),
+            Theme::Mocha      => ((30, 30, 46),(24, 24, 37)),
+        }
+    }
+    pub fn danger(self) -> (u8,u8,u8) {
+        match self {
+            Theme::Mocha => (243,139,168),
+            _            => (200, 70, 70),
+        }
+    }
+    pub fn warning(self) -> (u8,u8,u8) {
+        match self {
+            Theme::Mocha => (249,226,175),
+            _            => (220,160, 40),
+        }
+    }
+    pub fn success(self) -> (u8,u8,u8) {
+        match self {
+            Theme::Mocha => (166,227,161),
+            _            => (120,220,160),
+        }
+    }
+    pub fn info(self) -> (u8,u8,u8) {
+        match self {
+            Theme::Mocha => (137,180,250),
+            _            => (80,180,140),
+        }
+    }
+    pub fn text_dim(self) -> (u8,u8,u8) {
+        match self {
+            Theme::Mocha      => (108,112,134),
+            Theme::MatteBlack => (180,170,160),
+            _                 => (110,130,110),
         }
     }
 }
 
 // ── PieceStyle ────────────────────────────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PieceStyle { Unicode, Letters, FatLetters, Blocks }
+pub enum PieceStyle { Unicode, Ascii }
 impl PieceStyle {
     pub const ALL: &'static [PieceStyle] = &[
-        PieceStyle::Unicode, PieceStyle::Letters, PieceStyle::FatLetters, PieceStyle::Blocks,
+        PieceStyle::Unicode, PieceStyle::Ascii,
     ];
     pub fn name(self) -> &'static str {
         match self {
-            PieceStyle::Unicode    => "Unicode symbols  \u{2654}\u{2655}\u{2656}\u{2657}\u{2658}\u{2659}",
-            PieceStyle::Letters    => "ASCII letters    K Q R B N P",
-            PieceStyle::FatLetters => "Bracketed        [K][Q][R]\u{2026}",
-            PieceStyle::Blocks      => "Block art        \u{2588}\u{2588}\u{2588} (big pieces)",
-        }
-    }
-    pub fn render(self, sym: &'static str, letter: char, is_white: bool) -> String {
-        match self {
-            PieceStyle::Unicode => sym.to_string(),
-            PieceStyle::Letters => {
-                let c = if is_white { letter.to_ascii_uppercase() } else { letter.to_ascii_lowercase() };
-                c.to_string()
-            }
-            PieceStyle::Blocks     => sym.to_string(), // unused — handled in draw_board
-            PieceStyle::FatLetters => {
-                let c = if is_white { letter.to_ascii_uppercase() } else { letter.to_ascii_lowercase() };
-                format!("[{}]", c)
-            }
+            PieceStyle::Unicode => "Unicode symbols",
+            PieceStyle::Ascii   => "ASCII art (star pieces)",
         }
     }
 }
@@ -165,7 +163,6 @@ impl std::str::FromStr for AiDepth {
             "5" | "stockfish" => AiDepth::Stockfish,
             "2" | "medium"    => AiDepth::Medium,
             "4" | "expert"    => AiDepth::Expert,
-            "5" | "stockfish" => AiDepth::Stockfish,
             _                  => AiDepth::Hard,
         })
     }
@@ -282,11 +279,16 @@ pub struct Config {
     pub flip_board:      bool,
     pub auto_flip:       bool,
     pub confirm_move:    bool,
+    pub auto_promote:    bool,
     pub ui_mode:         UiMode,
     /// Auto-save board PNG when a game ends (default: false)
     pub auto_save_png:   bool,
-    /// Optional Lichess API token for puzzle access (leave empty for anonymous)
+    /// Auto-save game JSON when a game ends (default: true)
+    pub auto_save_game:  bool,
+    /// Optional Lichess API token (puzzles + online play)
     pub lichess_token:   String,
+    /// Lichess username (auto-filled from token, cached here)
+    pub lichess_username: String,
     /// Centipawn threshold for Blunder classification (default 300 = 3.0p)
     pub blunder_cp:      i32,
     /// Centipawn threshold for Mistake classification (default 100 = 1.0p)
@@ -300,6 +302,8 @@ pub struct Config {
     pub analysis_depth: u8,
     /// Highlight brightness 0-10 (0=subtle, 5=default, 10=vivid)
     pub highlight_brightness: u8,
+    /// TTY compatibility mode: 16-color, ASCII pieces, plain borders (default: false)
+    pub tty_mode: bool,
 }
 
 impl Default for Config {
@@ -315,9 +319,12 @@ impl Default for Config {
             flip_board:      false,
             auto_flip:       false,
             confirm_move:    false,
+            auto_promote:    false,
             ui_mode:         UiMode::Standard,
             auto_save_png:   false,
+            auto_save_game:  true,
             lichess_token:   String::new(),
+            lichess_username: String::new(),
             blunder_cp:      300,
             mistake_cp:      100,
             inaccuracy_cp:    50,
@@ -325,6 +332,7 @@ impl Default for Config {
             analysis_engine: AnalysisEngine::Builtin,
             analysis_depth: 2,
             highlight_brightness: 5,
+            tty_mode: false,
         }
     }
 }
@@ -343,19 +351,14 @@ impl Config {
                     match key {
                         "theme" => cfg.theme = match val {
                             "classic"    => Theme::Classic,
-                            "mocha"      => Theme::Mocha,
                             "slate"      => Theme::Slate,
-                            "midnight"   => Theme::Midnight,
-                            "crimson"    => Theme::Crimson,
                             "matteblack" => Theme::MatteBlack,
-                            "ocean"      => Theme::Ocean,
+                            "mocha"      => Theme::Mocha,
                             _            => Theme::Tournament,
                         },
                         "piece_style" => cfg.piece_style = match val {
-                            "letters"    => PieceStyle::Letters,
-                            "fatletters" => PieceStyle::FatLetters,
-                            "blocks"     => PieceStyle::Blocks,
-                            _            => PieceStyle::Unicode,
+                            "ascii"     => PieceStyle::Ascii,
+                            _           => PieceStyle::Unicode,
                         },
                         "ai_depth"     => cfg.ai_depth    = val.parse().unwrap_or(AiDepth::Hard),
                         "move_hints"   => cfg.move_hints  = match val {
@@ -375,13 +378,16 @@ impl Config {
                         "flip_board"      => cfg.flip_board   = val == "true",
                         "auto_flip"       => cfg.auto_flip    = val == "true",
                         "confirm_move"    => cfg.confirm_move = val == "true",
+                        "auto_promote"     => cfg.auto_promote  = val == "true",
                         "ui_mode" => cfg.ui_mode = match val {
                             "minimal"  => UiMode::Minimal,
                             "analysis" => UiMode::Analysis,
                             _          => UiMode::Standard,
                         },
                         "auto_save_png"   => cfg.auto_save_png   = val == "true",
+                        "auto_save_game"  => cfg.auto_save_game  = val == "true",
                         "lichess_token"   => cfg.lichess_token   = val.to_string(),
+                        "lichess_username" => cfg.lichess_username = val.to_string(),
                         "blunder_cp"      => cfg.blunder_cp      = val.parse().unwrap_or(300),
                         "mistake_cp"      => cfg.mistake_cp      = val.parse().unwrap_or(100),
                         "inaccuracy_cp"   => cfg.inaccuracy_cp   = val.parse().unwrap_or(50),
@@ -392,6 +398,7 @@ impl Config {
                         },
                         "analysis_depth" => cfg.analysis_depth = val.parse::<u8>().unwrap_or(2).clamp(1, 3),
                         "highlight_brightness" => cfg.highlight_brightness = val.parse::<u8>().unwrap_or(5).clamp(0, 10),
+                        "tty_mode" => cfg.tty_mode = val == "true",
                         _ => {}
                     }
                 }
@@ -423,24 +430,28 @@ impl Config {
                  flip_board       = {}\n\
                  auto_flip        = {}\n\
                  confirm_move     = {}\n\
+                 auto_promote     = {}\n\
                  ui_mode          = {}\n\
                  auto_save_png    = {}\n\
+                 auto_save_game   = {}\n\
                  lichess_token    = {}\n\
+                 lichess_username = {}\n\
                  blunder_cp       = {}\n\
                  mistake_cp       = {}\n\
                  inaccuracy_cp    = {}\n\
                  stockfish_skill  = {}\n\
                  analysis_engine  = {}\n\
                  analysis_depth   = {}\n\
-                  highlight_brightness = {}\n",
+                   highlight_brightness = {}\n\
+                   tty_mode            = {}\n",
+                self.tty_mode,
                 match self.theme {
                     Theme::Classic=>"classic", Theme::Tournament=>"tournament",
-                    Theme::Mocha=>"mocha",    Theme::Slate=>"slate",
-                    Theme::Midnight=>"midnight", Theme::Crimson=>"crimson", Theme::MatteBlack=>"matteblack", Theme::Ocean=>"ocean",
+                    Theme::Slate=>"slate", Theme::MatteBlack=>"matteblack",
+                    Theme::Mocha=>"mocha",
                 },
                 match self.piece_style {
-                    PieceStyle::Unicode=>"unicode", PieceStyle::Letters=>"letters",
-                    PieceStyle::FatLetters=>"fatletters", PieceStyle::Blocks=>"blocks",
+                    PieceStyle::Unicode=>"unicode", PieceStyle::Ascii=>"ascii",
                 },
                 match self.ai_depth { AiDepth::Stockfish => 5, d => d.depth() },
                 match self.move_hints {
@@ -453,13 +464,16 @@ impl Config {
                     TimeControl::Classical=>"classical",
                 },
                 self.show_coords, self.show_clock, self.flip_board,
-                self.auto_flip,   self.confirm_move,
-                match self.ui_mode {
+                 self.auto_flip,   self.confirm_move,
+                 self.auto_promote,
+                 match self.ui_mode {
                     UiMode::Minimal=>"minimal", UiMode::Standard=>"standard",
                     UiMode::Analysis=>"analysis",
                 },
-                self.auto_save_png,
+                 self.auto_save_png,
+                 self.auto_save_game,
                 self.lichess_token,
+                self.lichess_username,
                 self.blunder_cp, self.mistake_cp, self.inaccuracy_cp,
                 self.stockfish_skill,
                 match self.analysis_engine {

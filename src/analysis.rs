@@ -30,7 +30,13 @@ use crate::config::AnalysisEngine;
 use crate::engine::{
     start_board, apply, legal, Board, Castle, Color, Kind, Mv,
 };
-use crate::ai::{evaluate, best_mv_with_score};
+use crate::rcengine::board::Position as RCPosition;
+use crate::rcengine::search::Search;
+use crate::rcengine::types::{
+    Limits, Move as RCMove, PieceKind, Square, Color as RCColor,
+    NO_SQ, E1, E8, G1, C1, G8, C8,
+};
+use crate::rcengine::movegen;
 
 // ── Movetime for Stockfish (ms per half-position eval) ────────────────────────
 const SF_MOVETIME_MS: u32 = 300;
@@ -50,6 +56,8 @@ pub struct AnalysisResult {
     pub eval_after_cp:  i32,
     /// Best move from the pre-move position in UCI notation (e.g. "e2e4").
     pub best_move_uci:  Option<String>,
+    /// Principal variation continuation (space-separated UCI, e.g. "e2e4 e7e5 g1f3").
+    pub best_pv:        Option<String>,
     /// Top 3 candidate moves with scores: [(uci, cp), ...]
     pub top_moves:      Vec<(String, i32)>,
     /// Which colour made the move.
@@ -127,6 +135,12 @@ impl AnalysisHandle {
     pub fn try_recv(&self) -> Option<AnalysisResult> {
         self.result_rx.try_recv().ok()
     }
+
+    /// Drain all pending results without processing them.
+    /// Used after undo/redo/start-game to discard stale data.
+    pub fn drain_results(&self) {
+        while self.result_rx.try_recv().is_ok() {}
+    }
 }
 
 impl Drop for AnalysisHandle {
@@ -136,44 +150,33 @@ impl Drop for AnalysisHandle {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BACKEND 1 — Built-in minimax
+// BACKEND 1 — Built-in minimax (rcengine bitboard engine)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn builtin_thread(cmd_rx: Receiver<AnalyseCmd>, res_tx: Sender<AnalysisResult>, depth: u8) {
+    let mut search = Search::new();
     loop {
         match cmd_rx.recv() {
             Err(_) | Ok(AnalyseCmd::Quit) => break,
             Ok(AnalyseCmd::Analyse { move_idx, uci_before, uci_after, color_moved, depth: cmd_depth }) => {
-                let d = cmd_depth.max(1);
+                let d = (cmd_depth as u32).clamp(1, 16);
                 rlog!("[rchess/builtin] move {} ({:?}) depth={}", move_idx, color_moved, d);
 
-                // Position BEFORE the move — run multi-PV (top 3)
-                let (board_before, turn_before, ep_before, cast_before) =
-                    replay_uci(&uci_before);
+                let pos_before = uci_to_rcposition(&uci_before);
+                let (eval_before_cp, best_move_uci, best_pv, top_moves)
+                    = rcengine_top_moves(&mut search, &pos_before, d, 3);
 
-                let top = crate::ai::top_n_moves(
-                    &board_before, turn_before, ep_before, &cast_before, d, 3
-                );
+                let pos_after = uci_to_rcposition(&uci_after);
+                let eval_after_cp = evaluate_rc(&pos_after);
 
-                let best_move_uci = top.first().map(|(mv, _)| mv_to_uci(mv));
-                let eval_before_cp = top.first().map(|(_, s)| *s).unwrap_or_else(|| evaluate(&board_before));
-
-                // Top moves as (uci, cp) pairs — White-positive
-                let top_moves: Vec<(String, i32)> = top.into_iter()
-                    .map(|(mv, score)| (mv_to_uci(&mv), score))
-                    .collect();
-
-                // Position AFTER — static eval
-                let (board_after, _, _, _) = replay_uci(&uci_after);
-                let eval_after_cp = evaluate(&board_after);
-
-                rlog!("[rchess/builtin] before={} after={} best={:?}", eval_before_cp, eval_after_cp, best_move_uci);
+                rlog!("[rchess/builtin] eval_before={} after={} best={:?}", eval_before_cp, eval_after_cp, best_move_uci);
 
                 let _ = res_tx.send(AnalysisResult {
                     move_idx,
                     eval_before_cp,
                     eval_after_cp,
                     best_move_uci,
+                    best_pv,
                     top_moves,
                     color_moved,
                 });
@@ -181,7 +184,119 @@ fn builtin_thread(cmd_rx: Receiver<AnalyseCmd>, res_tx: Sender<AnalysisResult>, 
         }
     }
     rlog!("[rchess/builtin] thread exiting");
-    let _ = depth; // suppress unused warning when depth is from cmd
+    let _ = depth;
+}
+
+/// Evaluate a position using rcengine's static evaluation
+fn evaluate_rc(pos: &RCPosition) -> i32 {
+    crate::rcengine::search::evaluate(pos)
+}
+
+/// Build an rcengine Position from a space-separated UCI move string
+fn uci_to_rcposition(uci_str: &str) -> RCPosition {
+    let mut pos = RCPosition::from_fen(
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    ).unwrap_or_else(RCPosition::new);
+
+    for tok in uci_str.split_whitespace() {
+        if tok.len() < 4 { continue; }
+        if !tok.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { continue; }
+        if let Some(rcmv) = parse_uci_move(&pos, tok) {
+            pos.make_move(rcmv);
+        }
+    }
+    pos
+}
+
+/// Parse a UCI move string (e.g. "e2e4", "e7e8q") for rcengine Position.
+/// Returns None if parsing fails or the square indices are out of range.
+fn parse_uci_move(pos: &RCPosition, s: &str) -> Option<RCMove> {
+    if s.len() < 4 { return None; }
+    let bytes = s.as_bytes();
+    let from_file = bytes[0].wrapping_sub(b'a');
+    let from_rank = bytes[1].wrapping_sub(b'1');
+    let to_file   = bytes[2].wrapping_sub(b'a');
+    let to_rank   = bytes[3].wrapping_sub(b'1');
+    if from_file > 7 || from_rank > 7 || to_file > 7 || to_rank > 7 { return None; }
+    let from = from_rank * 8 + from_file;
+    let to   = to_rank * 8 + to_file;
+
+    let promo = if bytes.len() > 4 {
+        match bytes[4] {
+            b'n' => Some(PieceKind::Knight), b'b' => Some(PieceKind::Bishop),
+            b'r' => Some(PieceKind::Rook),   b'q' => Some(PieceKind::Queen),
+            _ => None,
+        }
+    } else { None };
+
+    if let Some(pk) = promo {
+        return Some(RCMove::new_promo(from, to, pk));
+    }
+
+    // Detect castling
+    if from == E1 && (to == G1 || to == C1) { return Some(RCMove::new_castle(from, to)); }
+    if from == E8 && (to == G8 || to == C8) { return Some(RCMove::new_castle(from, to)); }
+
+    // En passant
+    if let Some(piece) = pos.piece_on(from) {
+        if piece.0 == PieceKind::Pawn && to == pos.ep_sq {
+            return Some(RCMove::new_ep(from, to));
+        }
+    }
+
+    Some(RCMove::new(from, to))
+}
+
+/// Best-move analysis result: White-positive eval in centipawns, the best move
+/// in UCI, its principal variation, and the scored top moves.
+type TopMoves = (i32, Option<String>, Option<String>, Vec<(String, i32)>);
+
+/// Score top N moves: one full-depth search on root, then static eval for each move.
+/// Returns (eval_before_cp, best_move_uci, best_pv, top_moves_with_scores).
+/// eval_before_cp is White-positive centipawns from the root search.
+/// top_moves are (uci, White-positive-cp) sorted by score.
+fn rcengine_top_moves(search: &mut Search, pos: &RCPosition, depth: u32, n: usize) -> TopMoves {
+    let moves = movegen::generate_moves(pos);
+    if moves.is_empty() {
+        return (evaluate_rc(pos), None, None, vec![]);
+    }
+    let is_white = pos.side == RCColor::White;
+
+    // Single full-depth search on the root position
+    let (best_move_at_root, root_score_stm) = search.go_with_score(pos, &Limits {
+        depth, ..Limits::default()
+    });
+    // Convert root score from side-to-move perspective to White-positive
+    let eval_before_cp = if is_white { root_score_stm } else { -root_score_stm };
+    let best_uci = format!("{}", best_move_at_root);
+    let best_pv = {
+        let pv_str = search.pv(8);
+        if pv_str == "none" || pv_str.is_empty() { None } else { Some(pv_str) }
+    };
+
+    // Score each legal move using static eval of the resulting position (instant)
+    let mut scored: Vec<(String, i32)> = Vec::with_capacity(moves.len);
+    for i in 0..moves.len {
+        let mv = moves[i];
+        let mut p = pos.clone();
+        if !p.make_move(mv) { continue; }
+        let eval_after = evaluate_rc(&p);
+        let score = if is_white { eval_after } else { -eval_after };
+        scored.push((format!("{}", mv), score));
+    }
+
+    scored.sort_by_key(|m| std::cmp::Reverse(m.1));
+
+    // Promote best move to top
+    if let Some(i) = scored.iter().position(|(uci, _)| *uci == best_uci) {
+        if i != 0 {
+            let entry = scored.remove(i);
+            scored.insert(0, entry);
+        }
+    }
+
+    scored.truncate(n);
+    (eval_before_cp, Some(best_uci), best_pv, scored)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -190,7 +305,7 @@ fn builtin_thread(cmd_rx: Receiver<AnalyseCmd>, res_tx: Sender<AnalysisResult>, 
 
 fn try_spawn_stockfish(depth: u8, skill: u8) -> Option<AnalysisHandle> {
     // Test if stockfish exists
-    let child = Command::new("stockfish")
+    let child = Command::new("/usr/bin/stockfish")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -270,7 +385,7 @@ fn stockfish_thread(
                 writeln!(w, "go movetime {}", SF_MOVETIME_MS).ok();
                 w.flush().ok();
 
-                let (before_stm, best_uci, top3) = sf_read_result_multipv(&mut reader);
+                let (before_stm, best_uci, top3) = sf_read_result_multipv(&mut reader, Some(&mut w));
 
                 // Stockfish score is side-to-move positive → convert to White-positive
                 let eval_before_cp = match color_moved {
@@ -288,7 +403,7 @@ fn stockfish_thread(
                 writeln!(w, "go movetime {}", SF_MOVETIME_MS).ok();
                 w.flush().ok();
 
-                let (after_stm, _, _) = sf_read_result_multipv(&mut reader);
+                let (after_stm, _, _) = sf_read_result_multipv(&mut reader, Some(&mut w));
                 let eval_after_cp = match color_moved {
                     Color::White => -after_stm,
                     Color::Black =>  after_stm,
@@ -304,6 +419,7 @@ fn stockfish_thread(
                     eval_before_cp,
                     eval_after_cp,
                     best_move_uci: best_uci,
+                    best_pv: None,
                     top_moves,
                     color_moved,
                 });
@@ -322,13 +438,25 @@ fn stockfish_thread(
 /// Scores are from side-to-move perspective.
 fn sf_read_result_multipv(
     reader: &mut BufReader<std::process::ChildStdout>,
+    mut writer: Option<&mut BufWriter<std::process::ChildStdin>>,
 ) -> (i32, Option<String>, Vec<(String, i32)>) {
     // top_pv: map from multipv index (1..3) -> (score, move)
     let mut pv_map: std::collections::HashMap<u8, (i32, String)> = std::collections::HashMap::new();
     let mut best_move: Option<String> = None;
     let mut line = String::new();
 
+    // Read with a per-iteration timeout (stockfish should respond within movetime)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
     loop {
+        if std::time::Instant::now() > deadline {
+            rlog!("[rchess/sf] read timeout — sending stop");
+            if let Some(w) = writer.as_mut() {
+                let _ = writeln!(w, "stop");
+                let _ = w.flush();
+            }
+            // Read one more line (bestmove should follow)
+        }
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) | Err(_) => break,
@@ -380,9 +508,9 @@ fn sf_read_result_multipv(
 fn parse_score(line: &str) -> Option<i32> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let si = tokens.iter().position(|&t| t == "score")?;
-    match tokens.get(si + 1)? {
-        &"cp"   => tokens.get(si + 2)?.parse::<i32>().ok(),
-        &"mate" => {
+    match *tokens.get(si + 1)? {
+        "cp"   => tokens.get(si + 2)?.parse::<i32>().ok(),
+        "mate" => {
             let m: i32 = tokens.get(si + 2)?.parse().ok()?;
             Some(if m > 0 { 30_000 } else { -30_000 })
         }

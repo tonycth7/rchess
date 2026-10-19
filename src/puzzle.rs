@@ -1,8 +1,4 @@
-// src/puzzle.rs — Lichess daily puzzle via curl subprocess
-//
-// Fetches: https://lichess.org/api/puzzle/daily
-// Uses curl (always available on Arch) — no Rust TLS dependency needed.
-// This avoids the ring/rustls assembly linking issues in makepkg.
+// src/puzzle.rs — Lichess daily puzzle via ureq HTTP client
 
 use crate::engine::{Board, Castle, Color, Kind, Mv, legal, apply, start_board, game_status, Status};
 
@@ -36,118 +32,77 @@ pub enum PuzzleState {
 }
 
 pub fn fetch_daily_puzzle(token: &str) -> Result<Puzzle, String> {
-    use std::process::Command;
-
-    let url = "https://lichess.org/api/puzzle/daily";
-    rlog!("[rchess/puzzle] fetching via curl: {}", url);
-
-    let mut cmd = Command::new("curl");
-    cmd.args([
-        "--silent",
-        "--fail",
-        "--max-time", "15",
-        "--header", "Accept: application/json",
-        "--header", "User-Agent: rchess/0.7.3 (terminal chess)",
-    ]);
-
+    let agent = crate::http::agent(
+        std::time::Duration::from_secs(10),
+        Some(std::time::Duration::from_secs(20)),
+    );
+    let mut req = agent
+        .get("https://lichess.org/api/puzzle/daily")
+        .header("Accept", "application/json")
+        .header("User-Agent", concat!("rchess/", env!("CARGO_PKG_VERSION"), " (terminal chess)"));
     if !token.is_empty() {
-        cmd.args(["--header", &format!("Authorization: Bearer {}", token)]);
+        req = req.header("Authorization", format!("Bearer {token}"));
         rlog!("[rchess/puzzle] using API token");
     }
-    cmd.arg(url);
-
-    let output = cmd.output()
-        .map_err(|e| format!("curl not found: {} — install with: sudo pacman -S curl", e))?;
-
-    if !output.status.success() {
-        let code = output.status.code().unwrap_or(-1);
-        return Err(format!("curl failed (exit {}). Check internet / token.", code));
-    }
-
-    let body = String::from_utf8(output.stdout)
-        .map_err(|_| "curl returned non-UTF8 data".to_string())?;
-
-    rlog!("[rchess/puzzle] curl OK, body length: {}", body.len());
+    rlog!("[rchess/puzzle] fetching daily puzzle");
+    let mut resp = req
+        .call()
+        .map_err(|e| format!("HTTP error: {e}"))?;
+    let body = crate::http::read_text(&mut resp)?;
+    rlog!("[rchess/puzzle] OK, body length: {}", body.len());
     parse_puzzle_json(&body)
 }
 
-// Lichess daily puzzle JSON structure (2024):
-// {
-//   "game": { "pgn": "e4 e5 ..." },
-//   "puzzle": {
-//     "id": "abc12",
-//     "rating": 1482,
-//     "solution": ["e2e4","e7e5",...],   <- JSON ARRAY not a string
-//     "themes": ["fork","middlegame",...] <- JSON ARRAY
-//   },
-//   "user": null
-// }
-// The FEN is in "game" -> look for "fen": or reconstruct from "initialFen".
-// Note: the puzzle FEN field may be at root or inside "puzzle" object.
-fn parse_puzzle_json(json: &str) -> Result<Puzzle, String> {
-    rlog!("[rchess/puzzle] raw JSON first 400: {}", &json[..json.len().min(400)]);
+fn parse_puzzle_json(text: &str) -> Result<Puzzle, String> {
+    let preview: String = text.chars().take(200).collect();
+    rlog!("[rchess/puzzle] raw JSON first 200 chars: {preview}");
 
-    let puzzle_obj = find_str_after(json, "puzzle").unwrap_or_default();
-    let game_obj   = find_str_after(json, "game").unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("JSON parse error: {e}"))?;
 
-    // Puzzle ID
-    let id = extract_str_val(&puzzle_obj, "id")
-        .unwrap_or_else(|| "?".to_string());
+    let puzzle = &v["puzzle"];
+    let game   = &v["game"];
 
-    // Rating
-    let rating = extract_num_val(&puzzle_obj, "rating").unwrap_or(1500);
+    let id = puzzle["id"].as_str().unwrap_or("?").to_string();
+    let rating = puzzle["rating"].as_u64().unwrap_or(1500) as u32;
+    let initial_ply = puzzle["initialPly"].as_u64().unwrap_or(0) as usize;
 
-    // Solution: UCI moves array in puzzle.solution
-    let moves = extract_json_str_array(&puzzle_obj, "solution")
-        .or_else(|| extract_json_str_array(json, "solution"))
-        .or_else(|| extract_str_val(json, "moves")
-            .map(|s| s.split_whitespace().map(|m| m.to_string()).collect()))
+    let moves: Vec<String> = puzzle["solution"].as_array()
+        .map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    // Themes
-    let themes = extract_json_str_array(&puzzle_obj, "themes")
+    let themes: Vec<String> = puzzle["themes"].as_array()
+        .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    // initialPly: how many half-moves into the game the puzzle starts
-    let initial_ply = extract_num_val(&puzzle_obj, "initialPly")
-        .unwrap_or(0) as usize;
-
-    // FEN: Lichess does NOT provide a fen field — we must replay game.pgn
-    // up to initialPly half-moves to reach the puzzle start position.
-    // Fallback: try direct fen fields anyway for forward-compat.
-    let fen = extract_str_val(&puzzle_obj, "fen")
-        .or_else(|| extract_str_val(&puzzle_obj, "initialFen"))
-        .or_else(|| extract_str_val(&game_obj, "fen"))
-        .or_else(|| extract_str_val(json, "fen"))
-        .or_else(|| {
-            // Primary path: replay game.pgn up to initialPly
-            let pgn = extract_str_val(&game_obj, "pgn")?;
-            rlog!("[rchess/puzzle] replaying pgn ({} chars) to ply {}", pgn.len(), initial_ply);
-            fen_after_san_ply(&pgn, initial_ply)
-        })
-        .unwrap_or_default();
+    let fen = if let Some(f) = puzzle["fen"].as_str()
+        .or_else(|| puzzle["initialFen"].as_str())
+        .or_else(|| game["fen"].as_str())
+        .or_else(|| v["fen"].as_str())
+    {
+        f.to_string()
+    } else if let Some(pgn) = game["pgn"].as_str() {
+        rlog!("[rchess/puzzle] replaying pgn ({} chars) to ply {}", pgn.len(), initial_ply);
+        fen_after_san_ply(pgn, initial_ply).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     rlog!("[rchess/puzzle] id={} rating={} ply={} fen_len={} moves={} themes={}",
         id, rating, initial_ply, fen.len(), moves.len(), themes.len());
 
     if fen.is_empty() {
-        // Helpful error showing top-level keys
-        let top_keys: Vec<&str> = json.split('"')
-            .enumerate()
-            .filter(|(i, _)| i % 2 == 1)
-            .map(|(_, s)| s)
-            .filter(|s| !s.is_empty() && !s.contains('{') && !s.contains('}'))
-            .take(10)
-            .collect();
-        return Err(format!("Could not determine puzzle position. Top keys: {}",
-            top_keys.join(", ")));
+        let keys: Vec<String> = v.as_object()
+            .map(|o| o.keys().take(10).cloned().collect())
+            .unwrap_or_default();
+        return Err(format!("Could not determine puzzle position. Top keys: {}", keys.join(", ")));
     }
     if moves.is_empty() {
         return Err("No solution moves in puzzle response".to_string());
     }
 
     rlog!("[rchess/puzzle] success — fen={}", &fen[..fen.len().min(60)]);
-    Ok(Puzzle { id, fen, moves, rating, themes, solution_start: 1 })
+    Ok(Puzzle { id, fen, moves, rating, themes, solution_start: initial_ply % 2 })
 }
 
 /// Replay SAN moves (space-separated, as Lichess PGN field) up to `ply` half-moves.
@@ -188,7 +143,6 @@ fn fen_after_san_ply(pgn_moves: &str, ply: usize) -> Option<String> {
     Some(board_to_fen(&board, color, ep, &cast))
 }
 
-/// Encode board state as a FEN string.
 fn board_to_fen(
     board: &crate::engine::Board,
     color: crate::engine::Color,
@@ -197,11 +151,11 @@ fn board_to_fen(
 ) -> String {
     use crate::engine::{Color as C, Kind};
     let mut ranks = vec![];
-    for r in 0..8 {
+    for row in board.iter() {
         let mut rank = String::new();
         let mut empty = 0u8;
-        for c in 0..8 {
-            match board[r][c] {
+        for cell in row.iter() {
+            match cell {
                 None => empty += 1,
                 Some(p) => {
                     if empty > 0 { rank.push((b'0' + empty) as char); empty = 0; }
@@ -233,61 +187,13 @@ fn board_to_fen(
     format!("{} {} {} {} 0 1", ranks.join("/"), turn, cas, ep_str)
 }
 
-/// Get the substring starting from just after the first occurrence of `"key":{`
-fn find_str_after(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":", key);
-    let start  = json.find(&needle)? + needle.len();
-    let rest   = json[start..].trim_start();
-    if rest.starts_with('{') {
-        // Find matching closing brace
-        let mut depth = 0usize;
-        let mut end   = 0usize;
-        for (i, ch) in rest.char_indices() {
-            match ch { '{' => depth += 1, '}' => { depth -= 1; if depth == 0 { end = i; break; } } _ => {} }
-        }
-        Some(rest[..=end].to_string())
-    } else {
-        Some(rest.to_string())
-    }
-}
-
-/// Extract a plain string value: "key":"value"
-fn extract_str_val(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\":\"", key);
-    let start  = json.find(&needle)? + needle.len();
-    let end    = json[start..].find('"')? + start;
-    let val    = json[start..end].to_string();
-    if val.is_empty() { None } else { Some(val) }
-}
-
-/// Extract a number value: "key":1234
-fn extract_num_val(json: &str, key: &str) -> Option<u32> {
-    let needle = format!("\"{}\":", key);
-    let start  = json.find(&needle)? + needle.len();
-    let rest   = json[start..].trim_start();
-    let end    = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    if end == 0 { return None; }
-    rest[..end].parse().ok()
-}
-
-/// Extract a JSON string array: "key":["val1","val2",...]
-fn extract_json_str_array(json: &str, key: &str) -> Option<Vec<String>> {
-    let needle = format!("\"{}\":[", key);
-    let start  = json.find(&needle)? + needle.len();
-    let rest   = &json[start..];
-    // Find closing ]
-    let end = rest.find(']').unwrap_or(rest.len());
-    let inner = &rest[..end];
-    let items: Vec<String> = inner.split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if items.is_empty() { None } else { Some(items) }
-}
+/// Parsed FEN components: board, side to move, en-passant square, castling
+/// rights, and fullmove number.
+pub type FenPosition = (Board, Color, Option<(usize, usize)>, Castle, u32);
 
 /// Parse a FEN string into board state.
-/// Returns (board, turn, ep, castling, fullmove) or an error string.
-pub fn parse_fen(fen: &str) -> Result<(Board, Color, Option<(usize,usize)>, Castle, u32), String> {
+/// Returns a [`FenPosition`] or an error string.
+pub fn parse_fen(fen: &str) -> Result<FenPosition, String> {
     let parts: Vec<&str> = fen.split_whitespace().collect();
     if parts.len() < 2 { return Err("FEN too short".to_string()); }
 

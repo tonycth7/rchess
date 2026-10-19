@@ -10,7 +10,7 @@
 //
 // Pillow itself:  sudo pacman -S python-pillow
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::config::Theme;
 use crate::engine::{Board, Color as PC, Kind};
@@ -21,12 +21,12 @@ pub fn render_board_png(
     flipped:   bool,
     last_from: Option<(usize, usize)>,
     last_to:   Option<(usize, usize)>,
-    out_path:  &PathBuf,
+    out_path:  &Path,
 ) -> bool {
     let mut board_str = String::with_capacity(64);
-    for r in 0..8usize {
-        for c in 0..8usize {
-            let ch = match board[r][c] {
+    for row in board.iter() {
+        for cell in row.iter() {
+            let ch = match cell {
                 None => '.',
                 Some(p) => {
                     let b = match p.k {
@@ -55,17 +55,16 @@ pub fn render_board_png(
         ls, ds, lm, bg, acc, wp, bp, &out_str,
     );
 
-    let ts = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-    };
-    let tmp = std::env::temp_dir().join(format!("rchess_render_{}.py", ts));
+    // Non-deterministic tempfile: use nanoseconds + PID
+    let pid = std::process::id();
+    let ns = std::time::Instant::now().elapsed().as_nanos();
+    let tmp = std::env::temp_dir().join(format!("rchess_render_{}_{}.py", pid, ns));
     if std::fs::write(&tmp, &script).is_err() {
         crate::rlog!("[rchess/png] failed to write temp script");
         return false;
     }
 
-    let result = Command::new("python3").arg(&tmp).output();
+    let result = Command::new("/usr/bin/python3").arg(&tmp).output();
     let _ = std::fs::remove_file(&tmp);
 
     match result {
@@ -86,6 +85,9 @@ pub fn render_board_png(
     }
 }
 
+// The script template needs every palette entry; bundling them into a struct
+// would only move the same fields behind an extra name.
+#[allow(clippy::too_many_arguments)]
 fn build_script(
     board_str: &str, flipped: bool,
     lf: usize, lt: usize,
